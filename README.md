@@ -24,7 +24,9 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - `MetashapeAligner` for `analyzeImages(filter_mask=True)`, pair-aware low-quality camera disabling, `matchPhotos(...)`, and `alignCameras(...)`
 - `OverlapReducer` for post-alignment redundancy filtering using distance + rotation thresholds with station-level pair preservation
 - `LogWriter` for CSV / JSON phase outputs
+- `ConfigPersistence`, `GuiLogHandler`, and `PipelineController` as the GUI-facing orchestration layer
 - menu registration for:
+  - `Custom/DualFisheye/00 Open GUI`
   - `Custom/DualFisheye/01 Run Full Pipeline`
   - `Custom/DualFisheye/02 Extract Streams`
   - `Custom/DualFisheye/03 Select Frames`
@@ -56,6 +58,7 @@ Later phases still keep unvalidated API behavior behind explicit `TODO` markers:
 - whether `alignCameras(reset_alignment=True)` needs additional current-build guards beyond the current implementation
 - whether `Chunk.reduceOverlap(...)` should remain optional or become part of the main workflow
 - optional rig reference handling
+- which Qt binding should be treated as the preferred Metashape GUI binding on the current build
 
 The current revision does not assume the older `importMasks` workflow and keeps task-based bulk mask import as future optional work.
 
@@ -85,6 +88,7 @@ Default mask-related configuration in `PipelineConfig`:
 3. Edit `PipelineConfig` defaults in the script if your project paths differ from the repository layout.
 4. Confirm `input/source.mp4` is a 2-stream MP4 and that `front_stream_index` / `back_stream_index` match the file.
 5. Use one of these menu entries:
+   - `Custom/DualFisheye/00 Open GUI`
    - `Custom/DualFisheye/01 Run Full Pipeline`
    - `Custom/DualFisheye/02 Extract Streams`
    - `Custom/DualFisheye/03 Select Frames`
@@ -93,6 +97,38 @@ Default mask-related configuration in `PipelineConfig`:
    - `Custom/DualFisheye/06 Align`
    - `Custom/DualFisheye/07 Reduce Overlap`
    - `Custom/DualFisheye/08 Export Logs`
+
+### GUI Usage
+
+`00 Open GUI` opens a Qt-based dialog that reuses the existing pipeline classes without replacing the phase logic.
+
+Tabs:
+
+- `Basic`: input MP4, work folder, front/back stream index, `Run Full Pipeline`
+- `Preprocess`: frame sampling, blur thresholds, JPEG quality, `Extract Streams`, `Select Frames`
+- `Mask / Import`: YOLO model path, mask classes, dilation, `Generate Masks`, `Import to Metashape`
+- `Align / Reduce`: image quality threshold, keypoint/tiepoint limits, rig reference fields, `Align`, `Reduce Overlap`, `Export Logs`
+- `Logs / Summary`: GUI log view, selected/discarded counts, mask counts, enabled/aligned camera counts, current JSON summary
+
+The GUI supports:
+
+- Browse buttons for input MP4, work folder, and YOLO model path
+- per-phase execution and full-pipeline execution
+- colored log messages for info, warning, and error output
+- status and step progress updates during execution
+- `Save Config`, `Load Config`, and `Reset to Default`
+
+Config persistence:
+
+- the GUI saves the last-used config to `work/config/last_used_config.json`
+- missing keys are filled from `PipelineConfig` defaults when loading JSON
+- `Save Config` writes the current GUI values, and each GUI run also refreshes the last-used file before execution
+
+Relationship to the existing menu flow:
+
+- `01` through `08` remain available for direct phase execution without opening the GUI
+- the GUI is an additional operation layer on top of the same `FFmpegExtractor`, `BlurEvaluator`, `MaskGenerator`, `MetashapeImporter`, `MetashapeAligner`, and `OverlapReducer` classes
+- if Qt is unavailable in the embedded runtime, use `01` through `08` and validate the current Metashape Qt binding before enabling GUI use on that build
 
 `01 Run Full Pipeline` now runs Phase 1 through Phase 3:
 
@@ -129,6 +165,23 @@ For Phase 3 validation, then run `06 Align` and `07 Reduce Overlap` and confirm:
 - if redundant stations are disabled, both sides of the losing timestamp are disabled together
 - rerunning overlap cleanup can trigger `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
 
+### GUI Validation Checklist
+
+On a small sample, confirm the following in order:
+
+1. Open `Custom/DualFisheye/00 Open GUI`.
+2. Edit the required fields on `Basic`, `Preprocess`, `Mask / Import`, and `Align / Reduce`.
+3. Use each `Browse` button once and confirm the chosen path is reflected in the field.
+4. Click `Save Config`, close the dialog, reopen it, and confirm the previous values reload from `work/config/last_used_config.json`.
+5. Run `Extract Streams`, `Select Frames`, `Generate Masks`, `Import to Metashape`, `Align`, and `Reduce Overlap` individually and confirm the `Logs / Summary` tab updates after each step.
+6. Run `Run Full Pipeline` and confirm the progress label, progress bar, GUI logs, and summary panel all update through completion or a visible error state.
+
+### macOS Development Notes
+
+- The script keeps Unicode-safe OpenCV file IO because macOS project paths may contain spaces and non-ASCII characters.
+- Validate that `ffprobe` and `ffmpeg` are visible inside the Metashape Python process launched from macOS, not only in Terminal.
+- Confirm the embedded Metashape Python build exposes one of `PySide2`, `PySide6`, `PyQt5`, or `PyQt6` before depending on the GUI workflow for daily use.
+
 ## Windows Verification Notes
 
 When validating on Windows, check these points explicitly:
@@ -139,6 +192,8 @@ When validating on Windows, check these points explicitly:
 - Visually confirm `Metashape.Mask()` + `mask.load()` + `camera.mask = mask` still attaches the correct front/back masks on the Windows build.
 - Re-run `06 Align` and `07 Reduce Overlap` once to confirm `matchPhotos(...)` current argument names and `alignCameras(reset_alignment=True)` are accepted on that build.
 - Verify `work/logs/error.log` captures traceback details for a forced failure, so Windows-specific runtime issues are diagnosable.
+- Open `00 Open GUI`, confirm the dialog renders correctly, and verify that `Save Config` / `Load Config` still work with Windows paths.
+- If the GUI does not open, identify which Qt binding is available in the current Windows Metashape build before changing the fallback import order.
 
 Expected default paths:
 

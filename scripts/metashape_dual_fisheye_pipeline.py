@@ -11,14 +11,15 @@ Current implementation scope:
 from __future__ import annotations
 
 import csv
+import html
 import json
 import logging
 import math
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     import cv2  # type: ignore
@@ -40,15 +41,49 @@ try:
 except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
     YOLO = None  # type: ignore
 
+QT_BINDING = ""
+QtCore = None  # type: ignore
+QtGui = None  # type: ignore
+QtWidgets = None  # type: ignore
+
+# TODO: validate the preferred Qt binding on the current Metashape build; keep fallback imports localized.
+for _qt_binding, _qt_modules in (
+    ("PySide2", ("PySide2",)),
+    ("PySide6", ("PySide6",)),
+    ("PyQt5", ("PyQt5",)),
+    ("PyQt6", ("PyQt6",)),
+):
+    try:
+        if _qt_binding == "PySide2":
+            from PySide2 import QtCore, QtGui, QtWidgets  # type: ignore
+        elif _qt_binding == "PySide6":
+            from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
+        elif _qt_binding == "PyQt5":
+            from PyQt5 import QtCore, QtGui, QtWidgets  # type: ignore
+        else:
+            from PyQt6 import QtCore, QtGui, QtWidgets  # type: ignore
+    except ImportError:
+        continue
+    QT_BINDING = _qt_binding
+    break
+
 
 LOGGER = logging.getLogger("dual_fisheye_pipeline")
 _MENU_REGISTERED = False
+_GUI_DIALOG = None
 
 
 def _default_project_root() -> Path:
     """Return the repository root derived from this script location."""
 
     return Path(__file__).resolve().parents[1]
+
+
+def _default_last_used_config_path(project_root: Optional[Path] = None) -> Path:
+    """Return the stable launcher-side config location used on GUI startup."""
+
+    root = project_root or _default_project_root()
+    return root / "work" / "config" / "last_used_config.json"
 
 
 def _as_serializable(value: Any) -> Any:
@@ -187,6 +222,10 @@ class PipelineConfig:
         return self.work_root / "logs"
 
     @property
+    def config_dir(self) -> Path:
+        return self.work_root / "config"
+
+    @property
     def temp_dir(self) -> Path:
         return self.work_root / "temp"
 
@@ -217,6 +256,10 @@ class PipelineConfig:
     @property
     def error_log_path(self) -> Path:
         return self.log_dir / "error.log"
+
+    @property
+    def last_used_config_path(self) -> Path:
+        return self.config_dir / "last_used_config.json"
 
     def validate(self, require_input: bool = False) -> None:
         """Validate user-editable configuration values."""
@@ -261,6 +304,7 @@ class PipelineConfig:
             self.mask_front_dir,
             self.mask_back_dir,
             self.log_dir,
+            self.config_dir,
             self.temp_dir,
             self.project_path.parent,
         ):
@@ -270,6 +314,51 @@ class PipelineConfig:
         """Serialize config for logs."""
 
         return {key: _as_serializable(value) for key, value in asdict(self).items()}
+
+    def update_from_mapping(self, data: Mapping[str, Any]) -> None:
+        """Update config values from a partially populated JSON-compatible mapping."""
+
+        for field_info in fields(self):
+            key = field_info.name
+            if key not in data:
+                continue
+            setattr(self, key, self._coerce_field_value(key, data[key], getattr(self, key)))
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "PipelineConfig":
+        """Build a config with defaults for any missing keys."""
+
+        config = cls()
+        config.update_from_mapping(data)
+        return config
+
+    @staticmethod
+    def _coerce_field_value(field_name: str, value: Any, default: Any) -> Any:
+        if value is None:
+            return None if field_name in ("fft_blur_threshold", "mask_device") else default
+        if field_name in ("project_root", "input_mp4", "work_root", "project_path"):
+            return Path(value)
+        if field_name == "mask_classes":
+            if isinstance(value, str):
+                return tuple(item.strip() for item in value.split(",") if item.strip())
+            if isinstance(value, (list, tuple)):
+                return tuple(str(item).strip() for item in value if str(item).strip())
+            return default
+        if field_name in ("rig_relative_location", "rig_relative_rotation"):
+            if isinstance(value, (list, tuple)) and len(value) == 3:
+                return tuple(float(item) for item in value)
+            return default
+        if isinstance(default, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if isinstance(default, int) and not isinstance(default, bool):
+            return int(value)
+        if isinstance(default, float):
+            return float(value)
+        if isinstance(default, Path):
+            return Path(value)
+        return value
 
 
 class PipelineError(RuntimeError):
@@ -374,6 +463,15 @@ def configure_logging(config: PipelineConfig) -> None:
         handler.setFormatter(formatter)
         LOGGER.addHandler(handler)
 
+    has_stream_handler = any(
+        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+        for handler in LOGGER.handlers
+    )
+    if not has_stream_handler:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        LOGGER.addHandler(stream_handler)
+
 
 def save_metashape_document(config: PipelineConfig) -> None:
     """Persist the active Metashape document to the configured project path."""
@@ -412,6 +510,53 @@ class LogWriter:
         """Persist a summary document."""
 
         self.write_json(path, summary)
+
+
+class ConfigPersistence:
+    """JSON persistence for GUI-editable pipeline configuration."""
+
+    def load(self, path: Path) -> PipelineConfig:
+        """Load config JSON while preserving defaults for missing keys."""
+
+        if not path.exists():
+            raise FileNotFoundError("Config JSON not found: {0}".format(path))
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, Mapping):
+            raise PipelineError("Config JSON root must be an object.")
+        return PipelineConfig.from_mapping(payload)
+
+    def save(self, config: PipelineConfig, path: Optional[Path] = None) -> Path:
+        """Save config JSON to the requested path or the work-local default."""
+
+        target_path = path or config.last_used_config_path
+        payload = config.to_dict()
+        self._write_json(target_path, payload)
+        launcher_path = _default_last_used_config_path(config.project_root)
+        if launcher_path.resolve() != target_path.resolve():
+            self._write_json(launcher_path, payload)
+        return target_path
+
+    @staticmethod
+    def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+class GuiLogHandler(logging.Handler):
+    """Forward log records into the GUI without changing core logging paths."""
+
+    def __init__(self, callback: Callable[[int, str], None]) -> None:
+        super().__init__(level=logging.INFO)
+        self.callback = callback
+        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.callback(record.levelno, self.format(record))
+        except Exception:
+            self.handleError(record)
 
 
 @dataclass
@@ -1796,22 +1941,29 @@ class OverlapReducer:
             raise PipelineError("Metashape module is not available in this Python runtime.")
 
 
-class DualFisheyePipeline:
-    """High-level orchestration for menu-triggered pipeline phases."""
+class PipelineController:
+    """Shared orchestration layer for menu callbacks and GUI actions."""
 
-    def __init__(self, config: Optional[PipelineConfig] = None) -> None:
-        self.config = config or PipelineConfig()
-        self.logs = LogWriter()
+    def __init__(
+        self,
+        config: PipelineConfig,
+        logs: Optional[LogWriter] = None,
+        progress_callback: Optional[Callable[[str, str, int, int], None]] = None,
+    ) -> None:
+        self.config = config
+        self.logs = logs or LogWriter()
         self.extractor = FFmpegExtractor(self.config, self.logs)
         self.blur_evaluator = BlurEvaluator(self.config, self.logs)
         self.mask_generator = MaskGenerator(self.config, self.logs)
         self.importer = MetashapeImporter(self.config)
         self.aligner = MetashapeAligner(self.config, self.logs)
         self.overlap_reducer = OverlapReducer(self.config, self.logs)
+        self.progress_callback = progress_callback
+        self._current_step = ""
         configure_logging(self.config)
 
     def run_full_pipeline(self) -> PhaseResult:
-        """Execute Phase 1 through Phase 3 as a single menu path."""
+        """Execute the full pipeline using the existing phase components."""
 
         phase_results: List[PhaseResult] = []
         for runner in (
@@ -1828,10 +1980,8 @@ class DualFisheyePipeline:
             if result.status == "error":
                 break
 
-        overall_status = "ok"
-        if any(result.status == "error" for result in phase_results):
-            overall_status = "error"
-        summary_payload = self._build_log_summary({"phases": [result.to_dict() for result in phase_results]})
+        overall_status = "error" if any(result.status == "error" for result in phase_results) else "ok"
+        summary_payload = self.build_log_summary({"phases": [result.to_dict() for result in phase_results]})
         summary_message = "Phase 1 through Phase 3 completed through alignment, overlap reduction, and log export."
         if overall_status == "error":
             failed_phase = next((result.phase for result in phase_results if result.status == "error"), "unknown")
@@ -1846,47 +1996,29 @@ class DualFisheyePipeline:
         return summary
 
     def run_extract_streams(self) -> PhaseResult:
-        return self._run_phase(self.extractor.run, "extract_streams")
+        return self._run_phase(self._run_extract_streams_impl, "extract_streams", require_input=True)
 
     def run_select_frames(self) -> PhaseResult:
-        return self._run_phase(
-            lambda: self.blur_evaluator.select_pairs(
-                self.config.extracted_front_dir,
-                self.config.extracted_back_dir,
-                self.config.selected_front_dir,
-                self.config.selected_back_dir,
-            ),
-            "select_frames",
-        )
+        return self._run_phase(self._run_select_frames_impl, "select_frames")
 
     def run_generate_masks(self) -> PhaseResult:
-        return self._run_phase(self.mask_generator.run, "generate_masks")
+        return self._run_phase(self._run_generate_masks_impl, "generate_masks")
 
     def run_import_to_metashape(self) -> PhaseResult:
-        return self._run_phase(self.importer.run, "import_to_metashape")
+        return self._run_phase(self._run_import_to_metashape_impl, "import_to_metashape")
 
     def run_align(self) -> PhaseResult:
-        return self._run_phase(self.aligner.run, "align")
+        return self._run_phase(self._run_align_impl, "align")
 
     def run_reduce_overlap(self) -> PhaseResult:
-        return self._run_phase(self.overlap_reducer.run, "reduce_overlap")
+        return self._run_phase(self._run_reduce_overlap_impl, "reduce_overlap")
 
     def run_export_logs(self) -> PhaseResult:
-        return self._run_phase(self._export_logs, "export_logs")
+        return self._run_phase(self._run_export_logs_impl, "export_logs")
 
-    def _export_logs(self) -> PhaseResult:
-        """Write a simple summary snapshot of available logs."""
+    def build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Build a compact summary of config, logs, and the active chunk."""
 
-        summary = self._build_log_summary()
-        self.logs.write_summary(self.config.summary_log_path, summary)
-        return PhaseResult(
-            phase="export_logs",
-            status="ok",
-            message="Exported the current pipeline log summary.",
-            details={"summary_path": self.config.summary_log_path},
-        )
-
-    def _build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         required_logs = {
             "ffprobe.json": self.config.ffprobe_log_path.exists(),
             "frame_quality.csv": self.config.frame_quality_log_path.exists(),
@@ -1906,28 +2038,891 @@ class DualFisheyePipeline:
             summary["active_chunk"] = {
                 "label": getattr(chunk, "label", ""),
                 "camera_count": len(getattr(chunk, "cameras", [])),
-                "enabled_camera_count": len([camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]),
+                "enabled_camera_count": len(
+                    [camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]
+                ),
             }
         if extra:
             summary.update(extra)
         return summary
 
-    def _run_phase(self, callback: Any, phase_name: str) -> PhaseResult:
-        """Wrap each phase with common validation and error logging."""
+    def _run_extract_streams_impl(self) -> PhaseResult:
+        self._set_step("extract_streams", "probe_streams", 1, 5)
+        payload = self.extractor.probe_streams(self.config.input_mp4)
 
+        self._set_step("extract_streams", "extract_front_stream", 2, 5)
+        self.extractor.extract_front_stream(
+            self.config.input_mp4, self.config.extracted_front_dir, self.config.front_stream_index
+        )
+
+        self._set_step("extract_streams", "extract_back_stream", 3, 5)
+        self.extractor.extract_back_stream(
+            self.config.input_mp4, self.config.extracted_back_dir, self.config.back_stream_index
+        )
+
+        self._set_step("extract_streams", "verify_frame_counts", 4, 5)
+        front_count, back_count = self.extractor.verify_frame_counts(
+            self.config.extracted_front_dir, self.config.extracted_back_dir
+        )
+
+        self._set_step("extract_streams", "complete", 5, 5)
+        streams = [stream for stream in payload.get("streams", []) if stream.get("codec_type") == "video"]
+        return PhaseResult(
+            phase="extract_streams",
+            status="ok",
+            message="Extracted front/back streams with matching frame counts.",
+            details={"front_count": front_count, "back_count": back_count, "video_stream_count": len(streams)},
+        )
+
+    def _run_select_frames_impl(self) -> PhaseResult:
+        self._set_step("select_frames", "select_pairs", 1, 1)
+        return self.blur_evaluator.select_pairs(
+            self.config.extracted_front_dir,
+            self.config.extracted_back_dir,
+            self.config.selected_front_dir,
+            self.config.selected_back_dir,
+        )
+
+    def _run_generate_masks_impl(self) -> PhaseResult:
+        self._set_step("generate_masks", "process_directory_front_back", 1, 1)
+        return self.mask_generator.run()
+
+    def _run_import_to_metashape_impl(self) -> PhaseResult:
+        MetashapeImporter._require_metashape()
+        doc = Metashape.app.document
+
+        self._set_step("import_to_metashape", "create_or_get_chunk", 1, 8)
+        chunk = self.importer.create_or_get_chunk(doc, name=self.config.chunk_name)
+        pairs = collect_frame_pairs(self.config.selected_front_dir, self.config.selected_back_dir)
+
+        self._set_step("import_to_metashape", "build_filename_sequence", 2, 8)
+        filenames = self.importer.build_filename_sequence(self.config.selected_front_dir, self.config.selected_back_dir)
+
+        self._set_step("import_to_metashape", "build_filegroups", 3, 8)
+        filegroups = self.importer.build_filegroups(len(pairs))
+        self.importer.validate_import_plan(filenames, filegroups)
+
+        expected_labels = self.importer.expected_camera_labels(
+            self.config.selected_front_dir, self.config.selected_back_dir
+        )
+        import_state = self.importer.detect_existing_import_state(chunk, expected_labels)
+        if import_state == "other":
+            raise PipelineError(
+                "Chunk '{0}' already contains cameras unrelated to the current selected frame set. "
+                "Use a clean chunk label before importing.".format(getattr(chunk, "label", self.config.chunk_name))
+            )
+        if import_state == "partial":
+            raise PipelineError(
+                "Chunk '{0}' already contains a partial subset of the selected camera labels. "
+                "Use a clean chunk label before re-importing.".format(getattr(chunk, "label", self.config.chunk_name))
+            )
+
+        imported_now = False
+        if import_state != "complete":
+            self._set_step("import_to_metashape", "import_multiplane_images", 4, 8)
+            self.importer.import_multiplane_images(chunk, filenames, filegroups)
+            imported_now = True
+
+        self._set_step("import_to_metashape", "set_sensor_types", 5, 8)
+        self.importer.set_sensor_types(chunk)
+
+        self._set_step("import_to_metashape", "apply_rig_reference", 6, 8)
+        self.importer.apply_rig_reference(chunk, self.config)
+
+        self._set_step("import_to_metashape", "apply_masks_from_disk", 7, 8)
+        applied_masks, missing_labels = self.importer.apply_masks_from_disk(
+            chunk, self.config.mask_front_dir, self.config.mask_back_dir
+        )
+        if missing_labels:
+            raise PipelineError(
+                "Mask PNGs are missing for {0} camera(s). Run Generate Masks first.".format(len(missing_labels))
+            )
+
+        self._set_step("import_to_metashape", "save_document", 8, 8)
+        self.importer.save_document(doc)
+        return PhaseResult(
+            phase="import_to_metashape",
+            status="ok",
+            message="Imported selected front/back pairs using MultiplaneLayout and applied per-camera masks.",
+            details={
+                "chunk_label": getattr(chunk, "label", self.config.chunk_name),
+                "pair_count": len(pairs),
+                "camera_count": len(getattr(chunk, "cameras", [])),
+                "imported_now": imported_now,
+                "applied_masks": applied_masks,
+                "sample_pairs": self.importer.build_small_sample(
+                    self.config.selected_front_dir,
+                    self.config.selected_back_dir,
+                    sample_pairs=min(4, len(pairs)),
+                ),
+            },
+        )
+
+    def _run_align_impl(self) -> PhaseResult:
+        MetashapeAligner._require_metashape()
+        chunk = getattr(Metashape.app.document, "chunk", None)
+        if chunk is None:
+            return PhaseResult("align", "skipped", "No active chunk is available.", {})
+        if not getattr(chunk, "cameras", []):
+            return PhaseResult("align", "skipped", "Active chunk has no cameras to align.", {})
+
+        self._set_step("align", "analyze_image_quality", 1, 6)
+        self.aligner.analyze_image_quality(chunk)
+
+        self._set_step("align", "disable_low_quality_cameras", 2, 6)
+        disabled_count, quality_decisions = self.aligner.disable_low_quality_cameras(
+            chunk, threshold=self.config.metashape_image_quality_threshold
+        )
+
+        self._set_step("align", "export_quality_log_before_align", 3, 6)
+        self.aligner.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
+
+        enabled_camera_count = sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True))
+        if enabled_camera_count < 2:
+            raise PipelineError("Fewer than two enabled cameras remain after Image/Quality filtering.")
+
+        self._set_step("align", "match_photos", 4, 6)
+        self.aligner.match_photos(chunk, self.config)
+
+        self._set_step("align", "align_cameras", 5, 6)
+        self.aligner.align_cameras(chunk)
+
+        self._set_step("align", "export_quality_log_and_save", 6, 6)
+        self.aligner.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
+        aligned_camera_count = self.aligner.aligned_camera_count(chunk)
+        if aligned_camera_count < 2:
+            raise PipelineError(
+                "Alignment produced too few aligned cameras: {0}. Check masks, quality thresholds, and overlap.".format(
+                    aligned_camera_count
+                )
+            )
+        save_metashape_document(self.config)
+        return PhaseResult(
+            phase="align",
+            status="ok",
+            message="Ran image quality analysis, disabled low-quality cameras, and aligned the active chunk.",
+            details={
+                "camera_count": len(getattr(chunk, "cameras", [])),
+                "enabled_camera_count": enabled_camera_count,
+                "disabled_low_quality_count": disabled_count,
+                "aligned_camera_count": aligned_camera_count,
+                "quality_csv": self.config.metashape_quality_log_path,
+            },
+        )
+
+    def _run_reduce_overlap_impl(self) -> PhaseResult:
+        OverlapReducer._require_metashape()
+        chunk = getattr(Metashape.app.document, "chunk", None)
+        if chunk is None:
+            return PhaseResult("reduce_overlap", "skipped", "No active chunk is available.", {})
+
+        self._set_step("reduce_overlap", "disable_redundant_cameras", 1, 4)
+        rows = self.overlap_reducer.disable_redundant_cameras(chunk, self.config)
+        disabled_station_count = len({row["disabled_frame_id"] for row in rows}) if rows else 0
+        details: Dict[str, Any] = {
+            "disabled_camera_count": len(rows),
+            "disabled_station_count": disabled_station_count,
+            "overlap_csv": self.config.overlap_reduction_log_path,
+        }
+
+        realigned = False
+        if rows and self.config.realign_after_overlap_reduction and len(self.overlap_reducer.get_enabled_cameras(chunk)) >= 2:
+            self._set_step("reduce_overlap", "realign_after_cleanup", 2, 4)
+            self.aligner.realign_after_cleanup(chunk, self.config)
+            realigned = True
+            details["aligned_camera_count_after_realign"] = self.aligner.aligned_camera_count(chunk)
+
+        if self.config.use_builtin_reduce_overlap:
+            self._set_step("reduce_overlap", "run_reduce_overlap_builtin", 3, 4)
+            details.update(self.overlap_reducer.run_reduce_overlap_builtin(chunk, overlap=self.config.overlap_target))
+
+        self._set_step("reduce_overlap", "export_overlap_log_and_save", 4, 4)
+        self.logs.write_csv(
+            self.config.overlap_reduction_log_path,
+            rows,
+            headers=(
+                "disabled_frame_id",
+                "disabled_station_label",
+                "camera_label",
+                "camera_side",
+                "previously_enabled",
+                "kept_frame_id",
+                "kept_station_label",
+                "kept_camera_label",
+                "distance",
+                "angle_deg",
+                "disabled_station_quality",
+                "kept_station_quality",
+                "disabled_station_blur_score",
+                "kept_station_blur_score",
+                "reason",
+            ),
+        )
+        save_metashape_document(self.config)
+        return PhaseResult(
+            phase="reduce_overlap",
+            status="ok",
+            message="Reduced redundant aligned stations using distance and rotation thresholds.",
+            details={**details, "realigned": realigned},
+        )
+
+    def _run_export_logs_impl(self) -> PhaseResult:
+        self._set_step("export_logs", "write_summary", 1, 1)
+        summary = self.build_log_summary()
+        self.logs.write_summary(self.config.summary_log_path, summary)
+        return PhaseResult(
+            phase="export_logs",
+            status="ok",
+            message="Exported the current pipeline log summary.",
+            details={"summary_path": self.config.summary_log_path},
+        )
+
+    def _set_step(self, phase_name: str, step_name: str, index: int, total: int) -> None:
+        self._current_step = step_name
+        LOGGER.info("%s/%s (%s/%s)", phase_name, step_name, index, total)
+        if self.progress_callback is not None:
+            self.progress_callback(phase_name, step_name, index, total)
+
+    def _run_phase(self, callback: Callable[[], PhaseResult], phase_name: str, require_input: bool = False) -> PhaseResult:
+        """Wrap each phase with common validation, progress tracking, and error logging."""
+
+        self._current_step = ""
         self.config.ensure_directories()
         try:
-            self.config.validate(require_input=phase_name in ("extract_streams", "run_full_pipeline"))
+            self.config.validate(require_input=require_input)
             result = callback()
             LOGGER.info("%s: %s", result.phase, result.message)
             return result
         except Exception as exc:  # pragma: no cover - exercised mainly inside Metashape.
-            LOGGER.exception("%s failed: %s", phase_name, exc)
+            LOGGER.exception("%s failed at step '%s': %s", phase_name, self._current_step or phase_name, exc)
             return PhaseResult(
                 phase=phase_name,
                 status="error",
                 message=str(exc),
-                details={"exception_type": exc.__class__.__name__},
+                details={
+                    "exception_type": exc.__class__.__name__,
+                    "failed_step": self._current_step or phase_name,
+                },
+            )
+
+
+class DualFisheyePipeline:
+    """Backward-compatible wrapper around the shared pipeline controller."""
+
+    def __init__(
+        self,
+        config: Optional[PipelineConfig] = None,
+        progress_callback: Optional[Callable[[str, str, int, int], None]] = None,
+    ) -> None:
+        self.config = config or PipelineConfig()
+        self.controller = PipelineController(self.config, progress_callback=progress_callback)
+        self.logs = self.controller.logs
+        self.extractor = self.controller.extractor
+        self.blur_evaluator = self.controller.blur_evaluator
+        self.mask_generator = self.controller.mask_generator
+        self.importer = self.controller.importer
+        self.aligner = self.controller.aligner
+        self.overlap_reducer = self.controller.overlap_reducer
+
+    def run_full_pipeline(self) -> PhaseResult:
+        return self.controller.run_full_pipeline()
+
+    def run_extract_streams(self) -> PhaseResult:
+        return self.controller.run_extract_streams()
+
+    def run_select_frames(self) -> PhaseResult:
+        return self.controller.run_select_frames()
+
+    def run_generate_masks(self) -> PhaseResult:
+        return self.controller.run_generate_masks()
+
+    def run_import_to_metashape(self) -> PhaseResult:
+        return self.controller.run_import_to_metashape()
+
+    def run_align(self) -> PhaseResult:
+        return self.controller.run_align()
+
+    def run_reduce_overlap(self) -> PhaseResult:
+        return self.controller.run_reduce_overlap()
+
+    def run_export_logs(self) -> PhaseResult:
+        return self.controller.run_export_logs()
+
+    def build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        return self.controller.build_log_summary(extra)
+
+
+if QtWidgets is not None:
+
+    class DualFisheyeMainDialog(QtWidgets.QDialog):
+        """Qt dialog that drives the existing pipeline components from Metashape."""
+
+        def __init__(self, config: Optional[PipelineConfig] = None, parent: Optional[Any] = None) -> None:
+            super().__init__(parent)
+            self.persistence = ConfigPersistence()
+            self.config = config or PipelineConfig()
+            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+            self._action_buttons: List[Any] = []
+            self._widgets: Dict[str, Any] = {}
+            self._summary_labels: Dict[str, Any] = {}
+            self._gui_log_handler = GuiLogHandler(self._append_log_entry)
+            LOGGER.addHandler(self._gui_log_handler)
+            self._build_ui()
+            self._populate_widgets_from_config(self.config)
+            self._load_last_used_config_if_available()
+            self.refresh_summary()
+
+        def closeEvent(self, event: Any) -> None:
+            self._save_last_used_config(silent=True)
+            try:
+                LOGGER.removeHandler(self._gui_log_handler)
+            except ValueError:
+                pass
+            super().closeEvent(event)
+
+        def _build_ui(self) -> None:
+            self.setWindowTitle("Dual Fisheye Pipeline")
+            self.resize(980, 760)
+
+            root_layout = QtWidgets.QVBoxLayout(self)
+
+            config_button_row = QtWidgets.QHBoxLayout()
+            save_button = QtWidgets.QPushButton("Save Config")
+            save_button.clicked.connect(self.save_config)
+            load_button = QtWidgets.QPushButton("Load Config")
+            load_button.clicked.connect(self.load_config)
+            reset_button = QtWidgets.QPushButton("Reset to Default")
+            reset_button.clicked.connect(self.reset_to_default)
+            config_button_row.addWidget(save_button)
+            config_button_row.addWidget(load_button)
+            config_button_row.addWidget(reset_button)
+            config_button_row.addStretch(1)
+            root_layout.addLayout(config_button_row)
+
+            self._action_buttons.extend([save_button, load_button, reset_button])
+
+            self.status_label = QtWidgets.QLabel("Ready")
+            self.status_label.setStyleSheet("padding: 6px; border: 1px solid #bcbcbc;")
+            root_layout.addWidget(self.status_label)
+
+            self.progress_label = QtWidgets.QLabel("Idle")
+            root_layout.addWidget(self.progress_label)
+
+            self.progress_bar = QtWidgets.QProgressBar()
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            root_layout.addWidget(self.progress_bar)
+
+            tabs = QtWidgets.QTabWidget()
+            tabs.addTab(self._build_basic_tab(), "Basic")
+            tabs.addTab(self._build_preprocess_tab(), "Preprocess")
+            tabs.addTab(self._build_mask_import_tab(), "Mask / Import")
+            tabs.addTab(self._build_align_tab(), "Align / Reduce")
+            tabs.addTab(self._build_logs_tab(), "Logs / Summary")
+            root_layout.addWidget(tabs)
+
+        def _build_basic_tab(self) -> Any:
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            form = QtWidgets.QFormLayout()
+
+            form.addRow("Input MP4", self._build_path_field("input_mp4", directory=False))
+            form.addRow("Work Folder", self._build_path_field("work_root", directory=True))
+            form.addRow("Front Stream Index", self._register_widget("front_stream_index", self._spin_box(0, 99)))
+            form.addRow("Back Stream Index", self._register_widget("back_stream_index", self._spin_box(0, 99)))
+
+            layout.addLayout(form)
+
+            run_button = QtWidgets.QPushButton("Run Full Pipeline")
+            run_button.clicked.connect(lambda: self._run_action("run_full_pipeline", self.pipeline.run_full_pipeline))
+            self._action_buttons.append(run_button)
+            layout.addWidget(run_button)
+            layout.addStretch(1)
+            return tab
+
+        def _build_preprocess_tab(self) -> Any:
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            form = QtWidgets.QFormLayout()
+
+            form.addRow(
+                "Extract Every N Frames",
+                self._register_widget("extract_every_n_frames", self._spin_box(1, 10000)),
+            )
+            form.addRow(
+                "Blur Threshold Front",
+                self._register_widget("blur_threshold_front", self._double_spin_box(0.0, 100000.0, 4)),
+            )
+            form.addRow(
+                "Blur Threshold Back",
+                self._register_widget("blur_threshold_back", self._double_spin_box(0.0, 100000.0, 4)),
+            )
+            form.addRow("FFT Blur Threshold", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
+            form.addRow("JPEG Quality", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
+
+            layout.addLayout(form)
+
+            button_row = QtWidgets.QHBoxLayout()
+            extract_button = QtWidgets.QPushButton("Extract Streams")
+            extract_button.clicked.connect(lambda: self._run_action("extract_streams", self.pipeline.run_extract_streams))
+            select_button = QtWidgets.QPushButton("Select Frames")
+            select_button.clicked.connect(lambda: self._run_action("select_frames", self.pipeline.run_select_frames))
+            button_row.addWidget(extract_button)
+            button_row.addWidget(select_button)
+            button_row.addStretch(1)
+            layout.addLayout(button_row)
+            self._action_buttons.extend([extract_button, select_button])
+            layout.addStretch(1)
+            return tab
+
+        def _build_mask_import_tab(self) -> Any:
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            form = QtWidgets.QFormLayout()
+
+            form.addRow("YOLO Model Path", self._build_path_field("mask_model_path", directory=False))
+            form.addRow("Mask Classes", self._register_widget("mask_classes", QtWidgets.QLineEdit()))
+            form.addRow("Mask Dilate Px", self._register_widget("mask_dilate_px", self._spin_box(0, 1024)))
+
+            layout.addLayout(form)
+
+            button_row = QtWidgets.QHBoxLayout()
+            mask_button = QtWidgets.QPushButton("Generate Masks")
+            mask_button.clicked.connect(lambda: self._run_action("generate_masks", self.pipeline.run_generate_masks))
+            import_button = QtWidgets.QPushButton("Import to Metashape")
+            import_button.clicked.connect(
+                lambda: self._run_action("import_to_metashape", self.pipeline.run_import_to_metashape)
+            )
+            button_row.addWidget(mask_button)
+            button_row.addWidget(import_button)
+            button_row.addStretch(1)
+            layout.addLayout(button_row)
+            self._action_buttons.extend([mask_button, import_button])
+            layout.addStretch(1)
+            return tab
+
+        def _build_align_tab(self) -> Any:
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            form = QtWidgets.QFormLayout()
+
+            form.addRow(
+                "Image Quality Threshold",
+                self._register_widget(
+                    "metashape_image_quality_threshold",
+                    self._double_spin_box(0.0, 1.0, 3, single_step=0.05),
+                ),
+            )
+            form.addRow("Keypoint Limit", self._register_widget("keypoint_limit", self._spin_box(1, 10000000)))
+            form.addRow("Tiepoint Limit", self._register_widget("tiepoint_limit", self._spin_box(1, 10000000)))
+            form.addRow(
+                "Camera Distance Threshold",
+                self._register_widget("camera_distance_threshold", self._double_spin_box(0.0, 1000.0, 4)),
+            )
+            form.addRow(
+                "Camera Angle Threshold Deg",
+                self._register_widget("camera_angle_threshold_deg", self._double_spin_box(0.0, 180.0, 4)),
+            )
+            form.addRow("Overlap Target", self._register_widget("overlap_target", self._spin_box(1, 99)))
+            form.addRow(
+                "Enable Rig Reference",
+                self._register_widget("enable_rig_reference", QtWidgets.QCheckBox("Use rig reference")),
+            )
+            form.addRow(
+                "Rig Relative Location",
+                self._register_widget("rig_relative_location", QtWidgets.QLineEdit()),
+            )
+            form.addRow(
+                "Rig Relative Rotation",
+                self._register_widget("rig_relative_rotation", QtWidgets.QLineEdit()),
+            )
+
+            layout.addLayout(form)
+
+            button_row = QtWidgets.QHBoxLayout()
+            align_button = QtWidgets.QPushButton("Align")
+            align_button.clicked.connect(lambda: self._run_action("align", self.pipeline.run_align))
+            reduce_button = QtWidgets.QPushButton("Reduce Overlap")
+            reduce_button.clicked.connect(lambda: self._run_action("reduce_overlap", self.pipeline.run_reduce_overlap))
+            export_button = QtWidgets.QPushButton("Export Logs")
+            export_button.clicked.connect(lambda: self._run_action("export_logs", self.pipeline.run_export_logs))
+            button_row.addWidget(align_button)
+            button_row.addWidget(reduce_button)
+            button_row.addWidget(export_button)
+            button_row.addStretch(1)
+            layout.addLayout(button_row)
+            self._action_buttons.extend([align_button, reduce_button, export_button])
+            layout.addStretch(1)
+            return tab
+
+        def _build_logs_tab(self) -> Any:
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+
+            summary_group = QtWidgets.QGroupBox("Summary")
+            summary_form = QtWidgets.QFormLayout(summary_group)
+            for key, label in (
+                ("selected_pairs", "Selected Pairs"),
+                ("discarded_pairs", "Discarded Pairs"),
+                ("mask_rows", "Mask Rows"),
+                ("masked_images", "Masked Images"),
+                ("quality_rows", "Quality Rows"),
+                ("overlap_rows", "Overlap Rows"),
+                ("enabled_cameras", "Enabled Cameras"),
+                ("aligned_cameras", "Aligned Cameras"),
+            ):
+                value_label = QtWidgets.QLabel("-")
+                self._summary_labels[key] = value_label
+                summary_form.addRow(label, value_label)
+            layout.addWidget(summary_group)
+
+            self.summary_text = QtWidgets.QPlainTextEdit()
+            self.summary_text.setReadOnly(True)
+            layout.addWidget(self.summary_text, 1)
+
+            self.log_view = QtWidgets.QTextEdit()
+            self.log_view.setReadOnly(True)
+            layout.addWidget(self.log_view, 2)
+            return tab
+
+        def _build_path_field(self, name: str, directory: bool) -> Any:
+            container = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(container)
+            row.setContentsMargins(0, 0, 0, 0)
+            line_edit = QtWidgets.QLineEdit()
+            browse_button = QtWidgets.QPushButton("Browse")
+            browse_button.clicked.connect(lambda: self._browse_path(name, directory))
+            row.addWidget(line_edit, 1)
+            row.addWidget(browse_button)
+            self._widgets[name] = line_edit
+            self._action_buttons.append(browse_button)
+            return container
+
+        def _register_widget(self, name: str, widget: Any) -> Any:
+            self._widgets[name] = widget
+            return widget
+
+        @staticmethod
+        def _spin_box(minimum: int, maximum: int) -> Any:
+            widget = QtWidgets.QSpinBox()
+            widget.setRange(minimum, maximum)
+            return widget
+
+        @staticmethod
+        def _double_spin_box(
+            minimum: float,
+            maximum: float,
+            decimals: int,
+            single_step: float = 0.1,
+        ) -> Any:
+            widget = QtWidgets.QDoubleSpinBox()
+            widget.setRange(minimum, maximum)
+            widget.setDecimals(decimals)
+            widget.setSingleStep(single_step)
+            return widget
+
+        def _browse_path(self, name: str, directory: bool) -> None:
+            current_path = self._widgets[name].text().strip()
+            start_dir = current_path or str(self.config.project_root)
+            if directory:
+                selected_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", start_dir)
+            else:
+                selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select File", start_dir)
+            if selected_path:
+                self._widgets[name].setText(selected_path)
+                if name == "work_root":
+                    self._set_status("info", "Work root changed. Save or run to persist the new config path.")
+
+        def _populate_widgets_from_config(self, config: PipelineConfig) -> None:
+            self._widgets["input_mp4"].setText(str(config.input_mp4))
+            self._widgets["work_root"].setText(str(config.work_root))
+            self._widgets["mask_model_path"].setText(str(config.mask_model_path))
+            self._widgets["front_stream_index"].setValue(config.front_stream_index)
+            self._widgets["back_stream_index"].setValue(config.back_stream_index)
+            self._widgets["extract_every_n_frames"].setValue(config.extract_every_n_frames)
+            self._widgets["blur_threshold_front"].setValue(config.blur_threshold_front)
+            self._widgets["blur_threshold_back"].setValue(config.blur_threshold_back)
+            self._widgets["fft_blur_threshold"].setText(
+                "" if config.fft_blur_threshold is None else str(config.fft_blur_threshold)
+            )
+            self._widgets["jpeg_quality"].setValue(config.jpeg_quality)
+            self._widgets["mask_classes"].setText(", ".join(config.mask_classes))
+            self._widgets["mask_dilate_px"].setValue(config.mask_dilate_px)
+            self._widgets["metashape_image_quality_threshold"].setValue(config.metashape_image_quality_threshold)
+            self._widgets["keypoint_limit"].setValue(config.keypoint_limit)
+            self._widgets["tiepoint_limit"].setValue(config.tiepoint_limit)
+            self._widgets["camera_distance_threshold"].setValue(config.camera_distance_threshold)
+            self._widgets["camera_angle_threshold_deg"].setValue(config.camera_angle_threshold_deg)
+            self._widgets["overlap_target"].setValue(config.overlap_target)
+            self._widgets["enable_rig_reference"].setChecked(config.enable_rig_reference)
+            self._widgets["rig_relative_location"].setText(
+                ", ".join(str(value) for value in config.rig_relative_location)
+            )
+            self._widgets["rig_relative_rotation"].setText(
+                ", ".join(str(value) for value in config.rig_relative_rotation)
+            )
+
+        def _sync_config_from_widgets(self) -> None:
+            config = PipelineConfig.from_mapping(self.config.to_dict())
+            config.update_from_mapping(
+                {
+                    "input_mp4": self._widgets["input_mp4"].text().strip(),
+                    "work_root": self._widgets["work_root"].text().strip(),
+                    "front_stream_index": self._widgets["front_stream_index"].value(),
+                    "back_stream_index": self._widgets["back_stream_index"].value(),
+                    "extract_every_n_frames": self._widgets["extract_every_n_frames"].value(),
+                    "blur_threshold_front": self._widgets["blur_threshold_front"].value(),
+                    "blur_threshold_back": self._widgets["blur_threshold_back"].value(),
+                    "fft_blur_threshold": self._parse_optional_float(self._widgets["fft_blur_threshold"].text()),
+                    "jpeg_quality": self._widgets["jpeg_quality"].value(),
+                    "mask_model_path": self._widgets["mask_model_path"].text().strip(),
+                    "mask_classes": self._widgets["mask_classes"].text().strip(),
+                    "mask_dilate_px": self._widgets["mask_dilate_px"].value(),
+                    "metashape_image_quality_threshold": self._widgets[
+                        "metashape_image_quality_threshold"
+                    ].value(),
+                    "keypoint_limit": self._widgets["keypoint_limit"].value(),
+                    "tiepoint_limit": self._widgets["tiepoint_limit"].value(),
+                    "camera_distance_threshold": self._widgets["camera_distance_threshold"].value(),
+                    "camera_angle_threshold_deg": self._widgets["camera_angle_threshold_deg"].value(),
+                    "overlap_target": self._widgets["overlap_target"].value(),
+                    "enable_rig_reference": self._widgets["enable_rig_reference"].isChecked(),
+                    "rig_relative_location": self._parse_vector(self._widgets["rig_relative_location"].text()),
+                    "rig_relative_rotation": self._parse_vector(self._widgets["rig_relative_rotation"].text()),
+                }
+            )
+            self.config = config
+            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+
+        def _save_last_used_config(self, silent: bool = False) -> None:
+            try:
+                self._sync_config_from_widgets()
+                target_path = self.persistence.save(self.config)
+                if not silent:
+                    self._set_status("ok", "Saved config to {0}".format(target_path))
+            except Exception as exc:
+                if not silent:
+                    self._set_status("error", "Failed to save config: {0}".format(exc))
+
+        def _load_last_used_config_if_available(self) -> None:
+            candidate_paths: List[Path] = []
+            for path in (
+                _default_last_used_config_path(self.config.project_root),
+                self.config.last_used_config_path,
+            ):
+                if path not in candidate_paths:
+                    candidate_paths.append(path)
+
+            for candidate_path in candidate_paths:
+                if not candidate_path.exists():
+                    continue
+                try:
+                    loaded = self.persistence.load(candidate_path)
+                except Exception as exc:
+                    self._append_log_entry(logging.WARNING, "Failed to load last used config: {0}".format(exc))
+                    continue
+                self.config = loaded
+                self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+                self._populate_widgets_from_config(self.config)
+                self._set_status("ok", "Loaded previous config from {0}".format(candidate_path))
+                return
+
+        def save_config(self) -> None:
+            self._save_last_used_config(silent=False)
+
+        def load_config(self) -> None:
+            current_dir = str(self.config.config_dir if self.config.config_dir.exists() else self.config.project_root)
+            selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load Config JSON",
+                current_dir,
+                "JSON Files (*.json);;All Files (*)",
+            )
+            if not selected_path:
+                return
+            try:
+                loaded = self.persistence.load(Path(selected_path))
+                self.config = loaded
+                self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+                self._populate_widgets_from_config(self.config)
+                self.refresh_summary()
+                self._set_status("ok", "Loaded config from {0}".format(selected_path))
+            except Exception as exc:
+                self._set_status("error", "Failed to load config: {0}".format(exc))
+
+        def reset_to_default(self) -> None:
+            self.config = PipelineConfig()
+            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+            self._populate_widgets_from_config(self.config)
+            self.refresh_summary()
+            self._set_status("info", "Reset GUI fields to default config values.")
+
+        def _run_action(self, action_name: str, runner: Callable[[], PhaseResult]) -> None:
+            self._set_running(True)
+            try:
+                self._sync_config_from_widgets()
+                self.persistence.save(self.config)
+                self._set_status("info", "Running {0}...".format(action_name))
+                result = runner()
+                failed_step = result.details.get("failed_step", "") if result.details else ""
+                if result.status == "error":
+                    message = result.message
+                    if failed_step:
+                        message = "{0} (failed step: {1})".format(message, failed_step)
+                    self._set_status("error", message)
+                elif result.status == "skipped":
+                    self._set_status("warning", result.message)
+                else:
+                    self._set_status("ok", result.message)
+                self.refresh_summary()
+            except Exception as exc:
+                LOGGER.exception("GUI action '%s' failed: %s", action_name, exc)
+                self._set_status("error", str(exc))
+            finally:
+                self._set_running(False)
+
+        def _set_running(self, is_running: bool) -> None:
+            for button in self._action_buttons:
+                button.setEnabled(not is_running)
+            if is_running:
+                self.progress_label.setText("Running...")
+            else:
+                self.progress_label.setText("Idle")
+                self.progress_bar.setRange(0, 1)
+                self.progress_bar.setValue(0)
+            self._process_events()
+
+        def _on_progress(self, phase_name: str, step_name: str, index: int, total: int) -> None:
+            self.progress_label.setText("{0}: {1}".format(phase_name, step_name))
+            self.progress_bar.setRange(0, max(1, total))
+            self.progress_bar.setValue(index)
+            self._process_events()
+
+        def _append_log_entry(self, levelno: int, message: str) -> None:
+            color = "#222222"
+            if levelno >= logging.ERROR:
+                color = "#b00020"
+            elif levelno >= logging.WARNING:
+                color = "#9c6500"
+            elif levelno >= logging.INFO:
+                color = "#0a4b78"
+            self.log_view.append('<span style="color:{0};">{1}</span>'.format(color, html.escape(message)))
+            self._process_events()
+
+        def _set_status(self, status: str, message: str) -> None:
+            palette = {
+                "ok": ("#e7f6e7", "#2b6f2b"),
+                "info": ("#e8f1fb", "#0a4b78"),
+                "warning": ("#fff4df", "#9c6500"),
+                "error": ("#fdecea", "#b00020"),
+            }
+            background, foreground = palette.get(status, ("#f0f0f0", "#333333"))
+            self.status_label.setText(message)
+            self.status_label.setStyleSheet(
+                "padding: 6px; border: 1px solid {0}; background: {1}; color: {0};".format(
+                    foreground, background
+                )
+            )
+            self._process_events()
+
+        def refresh_summary(self) -> None:
+            selected_pairs = 0
+            discarded_pairs = 0
+            if self.config.frame_quality_log_path.exists():
+                with self.config.frame_quality_log_path.open("r", encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        if str(row.get("keep_pair", "")).strip() in ("1", "True", "true"):
+                            selected_pairs += 1
+                        else:
+                            discarded_pairs += 1
+
+            mask_rows = 0
+            masked_images = 0
+            if self.config.mask_summary_log_path.exists():
+                with self.config.mask_summary_log_path.open("r", encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        mask_rows += 1
+                        try:
+                            if int(str(row.get("masked_pixels", "0")).strip() or "0") > 0:
+                                masked_images += 1
+                        except ValueError:
+                            continue
+
+            quality_rows = self._count_csv_rows(self.config.metashape_quality_log_path)
+            overlap_rows = self._count_csv_rows(self.config.overlap_reduction_log_path)
+            enabled_cameras = 0
+            aligned_cameras = 0
+            if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
+                chunk = Metashape.app.document.chunk
+                enabled_cameras = len(
+                    [camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]
+                )
+                aligned_cameras = self.pipeline.aligner.aligned_camera_count(chunk)
+
+            summary_values = {
+                "selected_pairs": selected_pairs,
+                "discarded_pairs": discarded_pairs,
+                "mask_rows": mask_rows,
+                "masked_images": masked_images,
+                "quality_rows": quality_rows,
+                "overlap_rows": overlap_rows,
+                "enabled_cameras": enabled_cameras,
+                "aligned_cameras": aligned_cameras,
+            }
+            for key, value in summary_values.items():
+                self._summary_labels[key].setText(str(value))
+
+            summary_payload = self.pipeline.build_log_summary(extra={"gui_summary": summary_values})
+            self.summary_text.setPlainText(json.dumps(summary_payload, indent=2, ensure_ascii=False))
+            self._process_events()
+
+        @staticmethod
+        def _count_csv_rows(path: Path) -> int:
+            if not path.exists():
+                return 0
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                return sum(1 for _ in csv.DictReader(handle))
+
+        @staticmethod
+        def _parse_optional_float(value: str) -> Optional[float]:
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError as exc:
+                raise PipelineError("FFT blur threshold must be blank or numeric.") from exc
+
+        @staticmethod
+        def _parse_vector(value: str) -> Tuple[float, float, float]:
+            if not value.strip():
+                return 0.0, 0.0, 0.0
+            parts = [item.strip() for item in value.split(",") if item.strip()]
+            if len(parts) != 3:
+                raise PipelineError("Rig vectors must contain exactly 3 comma-separated numbers.")
+            try:
+                return float(parts[0]), float(parts[1]), float(parts[2])
+            except ValueError as exc:
+                raise PipelineError("Rig vectors must contain numeric values.") from exc
+
+        @staticmethod
+        def _process_events() -> None:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.processEvents()
+
+
+else:
+
+    class DualFisheyeMainDialog(object):
+        """Fallback placeholder when Qt bindings are unavailable."""
+
+        def __init__(self, config: Optional[PipelineConfig] = None, parent: Optional[Any] = None) -> None:
+            del config
+            del parent
+            raise PipelineError(
+                "Qt bindings are not available in this Python runtime. "
+                "Use the existing menu actions and validate the current Metashape Qt binding."
             )
 
 
@@ -1942,10 +2937,37 @@ def _show_result(result: PhaseResult) -> None:
         print(message)
 
 
-def get_pipeline() -> DualFisheyePipeline:
+def get_pipeline(
+    config: Optional[PipelineConfig] = None,
+    progress_callback: Optional[Callable[[str, str, int, int], None]] = None,
+) -> DualFisheyePipeline:
     """Create a fresh pipeline instance for each menu invocation."""
 
-    return DualFisheyePipeline()
+    return DualFisheyePipeline(config=config, progress_callback=progress_callback)
+
+
+def menu_open_gui() -> None:
+    """Menu callback for the Qt-based GUI launcher."""
+
+    global _GUI_DIALOG
+    if _GUI_DIALOG is not None and hasattr(_GUI_DIALOG, "isVisible") and _GUI_DIALOG.isVisible():
+        _GUI_DIALOG.show()
+        if hasattr(_GUI_DIALOG, "raise_"):
+            _GUI_DIALOG.raise_()
+        if hasattr(_GUI_DIALOG, "activateWindow"):
+            _GUI_DIALOG.activateWindow()
+        return
+    try:
+        _GUI_DIALOG = DualFisheyeMainDialog()
+    except Exception as exc:
+        LOGGER.exception("open_gui failed: %s", exc)
+        _show_result(PhaseResult("open_gui", "error", str(exc), {"exception_type": exc.__class__.__name__}))
+        return
+    _GUI_DIALOG.show()
+    if hasattr(_GUI_DIALOG, "raise_"):
+        _GUI_DIALOG.raise_()
+    if hasattr(_GUI_DIALOG, "activateWindow"):
+        _GUI_DIALOG.activateWindow()
 
 
 def menu_run_full_pipeline() -> None:
@@ -2004,6 +3026,7 @@ def register_menu_items() -> None:
         return
 
     menu_items = (
+        ("00 Open GUI", menu_open_gui),
         ("01 Run Full Pipeline", menu_run_full_pipeline),
         ("02 Extract Streams", menu_extract_streams),
         ("03 Select Frames", menu_select_frames),
