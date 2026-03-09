@@ -1,0 +1,22 @@
+# .codex/config.toml
+# Metashape / ffmpeg / OpenCV / YOLO 開発向けの最小実用構成
+# macOS + VS Code + Codex を想定
+
+model = "gpt-5.4"
+model_provider = "openai"
+personality = "pragmatic"
+model_reasoning_effort = "medium"
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+web_search = "live"
+
+[sandbox_workspace_write]
+network_access = true
+
+[shell_environment_policy]
+inherit = "core"
+experimental_use_profile = true
+
+[tools]
+view_image = true
