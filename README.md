@@ -1,6 +1,6 @@
 # Metashape Dual Fisheye Pipeline
 
-Initial scaffold for a Metashape Professional Python pipeline that targets a dual-fisheye 2-stream MP4 workflow.
+Phase 1 implementation for a Metashape Professional Python pipeline that targets a dual-fisheye 2-stream MP4 workflow.
 
 ## Source References
 
@@ -17,6 +17,9 @@ The checklist takes priority over older snippets or background notes when choosi
 The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` with:
 
 - `PipelineConfig` as the central dataclass for paths and processing parameters
+- `FFmpegExtractor` for `ffprobe` JSON export and front/back JPEG extraction
+- `BlurEvaluator` for center-70-percent Laplacian variance scoring and pair-aware selection
+- `LogWriter` for CSV / JSON phase outputs
 - menu registration for:
   - `Custom/DualFisheye/01 Run Full Pipeline`
   - `Custom/DualFisheye/02 Extract Streams`
@@ -27,13 +30,15 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
   - `Custom/DualFisheye/07 Reduce Overlap`
   - `Custom/DualFisheye/08 Export Logs`
 - directory creation under `work/` and `project/`
-- ffprobe / ffmpeg extraction wiring
-- conservative paired frame selection that keeps both sides until blur scoring is implemented
+- ffprobe / ffmpeg extraction with configurable stream indexes
+- pair selection rule:
+  - if `front_score >= blur_threshold_front` or `back_score >= blur_threshold_back`, keep both images for that timestamp
+- `frame_quality.csv` output under `work/logs/`
 - placeholder logging for mask generation, Metashape import validation, and overlap reduction
 
 ## Current Limitations
 
-The scaffold keeps unvalidated API behavior behind explicit `TODO` markers:
+Later phases still keep unvalidated API behavior behind explicit `TODO` markers:
 
 - `MultiplaneLayout` `filenames` / `filegroups` validation on the current Metashape build
 - detector-backed mask generation
@@ -49,16 +54,33 @@ Expected runtime:
 
 - Metashape Professional with Python 3.8
 - `ffprobe` and `ffmpeg` available on `PATH`
-- optional future dependencies such as OpenCV or YOLO runtime inside the Metashape Python environment
+- OpenCV (`cv2`) and `numpy` available inside the Metashape Python environment
+- optional future YOLO runtime for mask generation
 
-No `requirements.txt` is included yet because the current scaffold only relies on the standard library plus the Metashape runtime and external executables.
+No `requirements.txt` is included yet because execution is expected from the Metashape Python runtime.
 
-## How To Run
+## Phase 1 Usage
 
 1. Open Metashape Professional.
 2. Run `scripts/metashape_dual_fisheye_pipeline.py` from the Metashape Python console or scripts menu.
 3. Edit `PipelineConfig` defaults in the script if your project paths differ from the repository layout.
-4. Use the `Custom/DualFisheye/...` menu entries.
+4. Confirm `input/source.mp4` is a 2-stream MP4 and that `front_stream_index` / `back_stream_index` match the file.
+5. Use one of these menu entries:
+   - `Custom/DualFisheye/01 Run Full Pipeline`
+   - `Custom/DualFisheye/02 Extract Streams`
+   - `Custom/DualFisheye/03 Select Frames`
+
+`01 Run Full Pipeline` currently runs Phase 1 only:
+
+1. `ffprobe` writes `work/logs/ffprobe.json`
+2. `ffmpeg` extracts:
+   - `work/extracted/front_raw/F_*.jpg`
+   - `work/extracted/back_raw/B_*.jpg`
+3. `Select Frames` scores each pair with the center-70-percent Laplacian variance
+4. If either side passes threshold, both images are copied to:
+   - `work/selected/images/front/`
+   - `work/selected/images/back/`
+5. Selection results are written to `work/logs/frame_quality.csv`
 
 Expected default paths:
 
@@ -69,12 +91,11 @@ Expected default paths:
 
 ## Logs
 
-The scaffold prepares these log outputs under `work/logs/`:
+Phase 1 produces these log outputs under `work/logs/`:
 
 - `ffprobe.json`
 - `frame_quality.csv`
-- `mask_summary.csv`
-- `metashape_quality.csv`
-- `overlap_reduction.csv`
 - `pipeline_summary.json`
 - `error.log`
+
+Later-phase placeholders may create additional CSVs when those menu items are used.

@@ -1,12 +1,12 @@
-"""Dual fisheye Metashape pipeline scaffold.
+"""Dual fisheye Metashape pipeline.
 
 This module is intended to be loaded from the Metashape Python runtime.
-The initial revision keeps the implementation conservative:
+Phase 1 implements:
 
-- ffprobe / ffmpeg orchestration is wired and logged.
-- frame selection keeps paired frames conservatively until blur scoring is added.
-- mask generation, MultiplaneLayout import validation, and overlap reduction keep
-  explicit TODO markers instead of assuming unverified API behavior.
+- ffprobe / ffmpeg orchestration for dual-stream extraction.
+- paired frame selection using center-70-percent Laplacian variance.
+- logging for ffprobe JSON, frame quality CSV, and phase summaries.
+- explicit TODO markers for later Metashape-specific phases.
 """
 
 from __future__ import annotations
@@ -20,6 +20,16 @@ import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
+    cv2 = None  # type: ignore
+
+try:
+    import numpy as np  # type: ignore
+except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
+    np = None  # type: ignore
 
 try:
     import Metashape  # type: ignore
@@ -170,12 +180,20 @@ class PipelineConfig:
     def validate(self, require_input: bool = False) -> None:
         """Validate user-editable configuration values."""
 
+        if self.front_stream_index < 0 or self.back_stream_index < 0:
+            raise ValueError("front_stream_index and back_stream_index must be >= 0.")
         if self.front_stream_index == self.back_stream_index:
             raise ValueError("front_stream_index and back_stream_index must differ.")
         if self.extract_every_n_frames < 1:
             raise ValueError("extract_every_n_frames must be >= 1.")
         if self.jpeg_quality < 1:
             raise ValueError("jpeg_quality must be >= 1.")
+        if self.blur_method != "laplacian_center70":
+            raise ValueError("Only blur_method='laplacian_center70' is supported in Phase 1.")
+        if self.blur_threshold_front < 0 or self.blur_threshold_back < 0:
+            raise ValueError("blur thresholds must be >= 0.")
+        if self.keep_rule != "either_side_ok_keep_both":
+            raise ValueError("keep_rule must remain 'either_side_ok_keep_both'.")
         if require_input and not self.input_mp4.exists():
             raise FileNotFoundError("Input MP4 not found: {0}".format(self.input_mp4))
 
@@ -273,13 +291,26 @@ class FFmpegExtractor:
             str(mp4_path),
         ]
         result = self._run_command(command)
-        payload = json.loads(result.stdout or "{}")
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise PipelineError("ffprobe did not return valid JSON output.") from exc
         self.logs.write_json(self.config.ffprobe_log_path, payload)
 
         streams = payload.get("streams", [])
         video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
         if len(video_streams) < 2:
             raise PipelineError("Expected a 2-stream MP4, but found fewer than 2 video streams.")
+        for stream_index, side in (
+            (self.config.front_stream_index, "front"),
+            (self.config.back_stream_index, "back"),
+        ):
+            if stream_index >= len(video_streams):
+                raise PipelineError(
+                    "{0}_stream_index={1} is out of range for {2} detected video streams.".format(
+                        side, stream_index, len(video_streams)
+                    )
+                )
         return payload
 
     def extract_front_stream(self, mp4_path: Path, out_dir: Path, stream_index: int) -> None:
@@ -295,8 +326,10 @@ class FFmpegExtractor:
     def verify_frame_counts(self, front_dir: Path, back_dir: Path) -> Tuple[int, int]:
         """Ensure extracted front/back frame counts match."""
 
-        front_count = len(sorted(front_dir.glob("F_*.jpg")))
-        back_count = len(sorted(back_dir.glob("B_*.jpg")))
+        front_count = len(self._list_frame_files(front_dir, "F"))
+        back_count = len(self._list_frame_files(back_dir, "B"))
+        if front_count == 0 or back_count == 0:
+            raise PipelineError("ffmpeg extraction produced no JPEG frames.")
         if front_count != back_count:
             raise PipelineError(
                 "Front/back extracted frame count mismatch: front={0}, back={1}".format(
@@ -331,26 +364,35 @@ class FFmpegExtractor:
         """Run ffmpeg for a single stream."""
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        for old_file in out_dir.glob("{0}_*.jpg".format(prefix)):
-            old_file.unlink()
+        self._clear_directory(out_dir, "{0}_*.jpg".format(prefix))
 
         output_pattern = out_dir / "{0}_%06d.jpg".format(prefix)
         command = ["ffmpeg", "-y", "-i", str(mp4_path), "-map", "0:v:{0}".format(stream_index)]
-
-        if self.config.extract_every_n_frames > 1:
-            command.extend(
-                [
-                    "-vf",
-                    "select=not(mod(n\\,{0}))".format(self.config.extract_every_n_frames),
-                    "-vsync",
-                    "vfr",
-                ]
-            )
-        else:
-            command.extend(["-vsync", "0"])
+        command.extend(self._build_frame_sampling_args())
 
         command.extend(["-q:v", str(self.config.jpeg_quality), str(output_pattern)])
         self._run_command(command)
+
+        if not self._list_frame_files(out_dir, prefix):
+            raise PipelineError(
+                "ffmpeg did not produce extracted frames for stream index {0}.".format(stream_index)
+            )
+
+    def _build_frame_sampling_args(self) -> List[str]:
+        """Build ffmpeg arguments for frame sampling.
+
+        This is intentionally isolated so extract_every_n_frames can grow later
+        without rewriting the front/back extraction code paths.
+        """
+
+        if self.config.extract_every_n_frames > 1:
+            return [
+                "-vf",
+                "select=not(mod(n\\,{0}))".format(self.config.extract_every_n_frames),
+                "-vsync",
+                "vfr",
+            ]
+        return ["-vsync", "0"]
 
     @staticmethod
     def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess:
@@ -373,54 +415,86 @@ class FFmpegExtractor:
             ) from exc
         return result
 
+    @staticmethod
+    def _clear_directory(directory: Path, pattern: str) -> None:
+        for old_file in directory.glob(pattern):
+            old_file.unlink()
+
+    @staticmethod
+    def _list_frame_files(directory: Path, prefix: str) -> List[Path]:
+        return sorted(directory.glob("{0}_*.jpg".format(prefix)))
+
 
 class BlurEvaluator:
-    """Frame scoring and paired selection scaffold."""
+    """Frame scoring and paired selection for Phase 1."""
 
     def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
         self.config = config
         self.logs = logs
 
     def compute_center70_mask(self, image: Any) -> Any:
-        """Placeholder for the center-70-percent scoring mask."""
+        """Build a circular mask centered in the image with a 70% diameter."""
 
-        # TODO: implement center-70-percent circular mask with OpenCV in a follow-up phase.
-        return image
+        self._require_cv_runtime()
+        if image is None or getattr(image, "size", 0) == 0:
+            raise PipelineError("Cannot compute a blur mask for an empty image.")
+
+        height, width = image.shape[:2]
+        radius = max(1, int(min(height, width) * 0.35))
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.circle(mask, (width // 2, height // 2), radius, 255, thickness=-1)
+        return mask
 
     def laplacian_score(self, image: Any) -> Optional[float]:
-        """Placeholder for the Laplacian blur score."""
+        """Compute Laplacian variance within the center-70-percent circle."""
 
-        # TODO: implement Laplacian variance scoring for paired blur evaluation.
-        return None
+        self._require_cv_runtime()
+        mask = self.compute_center70_mask(image)
+        laplacian = cv2.Laplacian(image, cv2.CV_64F)
+        masked_values = laplacian[mask > 0]
+        if masked_values.size == 0:
+            raise PipelineError("Center-70-percent mask produced no pixels for blur evaluation.")
+        return float(masked_values.var())
 
     def fft_blur_score(self, image: Any) -> Optional[float]:
         """Placeholder for optional FFT-based blur scoring."""
 
-        # TODO: implement optional FFT blur scoring once OpenCV-based baseline is validated.
+        # TODO: implement optional FFT blur scoring once the Laplacian baseline is validated.
+        del image
         return None
 
     def evaluate_pair(self, front_path: Path, back_path: Path) -> Dict[str, Any]:
-        """Return a conservative placeholder evaluation for a front/back pair."""
+        """Evaluate a front/back frame pair and apply the paired keep rule."""
 
+        front_frame_id = self._extract_frame_id(front_path, "F")
+        back_frame_id = self._extract_frame_id(back_path, "B")
+        if front_frame_id != back_frame_id:
+            raise PipelineError(
+                "Frame ID mismatch between paired images: {0} vs {1}".format(
+                    front_path.name, back_path.name
+                )
+            )
+
+        front_score = self._score_image(front_path)
+        back_score = self._score_image(back_path)
+        keep_pair = int(
+            front_score >= self.config.blur_threshold_front
+            or back_score >= self.config.blur_threshold_back
+        )
         return {
-            "frame_id": front_path.stem.split("_")[-1],
+            "frame_id": front_frame_id,
             "front_path": front_path.name,
             "back_path": back_path.name,
-            "front_score": "",
-            "back_score": "",
-            "keep_pair": 1,
-            "better_side": "TODO",
+            "front_score": round(front_score, 4),
+            "back_score": round(back_score, 4),
+            "keep_pair": keep_pair,
+            "better_side": self._better_side(front_score, back_score),
         }
 
     def select_pairs(self, front_dir: Path, back_dir: Path, out_front_dir: Path, out_back_dir: Path) -> PhaseResult:
-        """Copy all paired frames conservatively until blur scoring is implemented."""
+        """Evaluate extracted pairs, keep both sides when either side passes, and log the results."""
 
-        front_files = sorted(front_dir.glob("F_*.jpg"))
-        back_files = sorted(back_dir.glob("B_*.jpg"))
-        if not front_files or not back_files:
-            raise PipelineError("No extracted frames found. Run stream extraction first.")
-        if len(front_files) != len(back_files):
-            raise PipelineError("Front/back extracted frame counts do not match.")
+        pairs = self._collect_pairs(front_dir, back_dir)
 
         out_front_dir.mkdir(parents=True, exist_ok=True)
         out_back_dir.mkdir(parents=True, exist_ok=True)
@@ -428,10 +502,13 @@ class BlurEvaluator:
         self._clear_directory(out_back_dir, "B_*.jpg")
 
         rows: List[Dict[str, Any]] = []
-        for front_path, back_path in zip(front_files, back_files):
+        selected_pairs = 0
+        for front_path, back_path in pairs:
             row = self.evaluate_pair(front_path, back_path)
-            shutil.copy2(str(front_path), str(out_front_dir / front_path.name))
-            shutil.copy2(str(back_path), str(out_back_dir / back_path.name))
+            if row["keep_pair"]:
+                shutil.copy2(str(front_path), str(out_front_dir / front_path.name))
+                shutil.copy2(str(back_path), str(out_back_dir / back_path.name))
+                selected_pairs += 1
             rows.append(row)
 
         self.logs.write_csv(
@@ -447,14 +524,21 @@ class BlurEvaluator:
                 "better_side",
             ),
         )
+        if selected_pairs == 0:
+            raise PipelineError(
+                "No frame pairs met the blur thresholds. See {0}.".format(
+                    self.config.frame_quality_log_path
+                )
+            )
         return PhaseResult(
             phase="select_frames",
-            status="todo",
-            message=(
-                "Copied all paired frames conservatively. TODO: replace with blur scoring while preserving "
-                "the either-side-OK keep-both rule."
-            ),
-            details={"selected_pairs": len(rows)},
+            status="ok",
+            message="Selected paired frames using the either-side-OK keep-both rule.",
+            details={
+                "total_pairs": len(rows),
+                "selected_pairs": selected_pairs,
+                "rejected_pairs": len(rows) - selected_pairs,
+            },
         )
 
     @staticmethod
@@ -463,6 +547,83 @@ class BlurEvaluator:
 
         for old_file in directory.glob(pattern):
             old_file.unlink()
+
+    def _collect_pairs(self, front_dir: Path, back_dir: Path) -> List[Tuple[Path, Path]]:
+        """Collect and validate front/back pairs by frame ID."""
+
+        front_files = self._index_frames(front_dir, "F")
+        back_files = self._index_frames(back_dir, "B")
+        if not front_files or not back_files:
+            raise PipelineError("No extracted frames found. Run stream extraction first.")
+
+        front_ids = set(front_files)
+        back_ids = set(back_files)
+        if front_ids != back_ids:
+            missing_front = sorted(back_ids - front_ids)
+            missing_back = sorted(front_ids - back_ids)
+            raise PipelineError(
+                "Front/back frame IDs do not match. missing_front={0}, missing_back={1}".format(
+                    missing_front[:5], missing_back[:5]
+                )
+            )
+
+        return [(front_files[frame_id], back_files[frame_id]) for frame_id in sorted(front_files)]
+
+    def _index_frames(self, directory: Path, prefix: str) -> Dict[int, Path]:
+        """Index extracted JPEGs by numeric frame ID."""
+
+        frames: Dict[int, Path] = {}
+        for image_path in sorted(directory.glob("{0}_*.jpg".format(prefix))):
+            frame_id = self._extract_frame_id(image_path, prefix)
+            if frame_id in frames:
+                raise PipelineError("Duplicate frame ID detected: {0}".format(image_path.name))
+            frames[frame_id] = image_path
+        return frames
+
+    def _score_image(self, image_path: Path) -> float:
+        """Read an image and compute the configured primary blur score."""
+
+        image = self._read_grayscale_image(image_path)
+        if self.config.blur_method == "laplacian_center70":
+            score = self.laplacian_score(image)
+        else:
+            raise PipelineError("Unsupported blur_method: {0}".format(self.config.blur_method))
+        if score is None:
+            raise PipelineError("Blur score could not be computed for {0}".format(image_path))
+        return float(score)
+
+    def _read_grayscale_image(self, image_path: Path) -> Any:
+        """Read an image from disk as grayscale."""
+
+        self._require_cv_runtime()
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise PipelineError("Failed to read image for blur evaluation: {0}".format(image_path))
+        return image
+
+    @staticmethod
+    def _better_side(front_score: float, back_score: float) -> str:
+        if front_score > back_score:
+            return "front"
+        if back_score > front_score:
+            return "back"
+        return "tie"
+
+    @staticmethod
+    def _extract_frame_id(image_path: Path, prefix: str) -> int:
+        stem = image_path.stem
+        expected_prefix = "{0}_".format(prefix)
+        if not stem.startswith(expected_prefix):
+            raise PipelineError("Unexpected frame naming: {0}".format(image_path.name))
+        try:
+            return int(stem[len(expected_prefix) :])
+        except ValueError as exc:
+            raise PipelineError("Invalid frame ID in filename: {0}".format(image_path.name)) from exc
+
+    @staticmethod
+    def _require_cv_runtime() -> None:
+        if cv2 is None or np is None:
+            raise PipelineError("OpenCV and numpy are required for Phase 1 blur evaluation.")
 
 
 class MaskGenerator:
@@ -879,26 +1040,22 @@ class DualFisheyePipeline:
         configure_logging(self.config)
 
     def run_full_pipeline(self) -> PhaseResult:
-        """Execute the current scaffold phases in sequence."""
+        """Execute Phase 1 only: stream extraction and frame selection."""
 
-        phase_results = [
-            self.run_extract_streams(),
-            self.run_select_frames(),
-            self.run_generate_masks(),
-            self.run_import_to_metashape(),
-            self.run_align(),
-            self.run_reduce_overlap(),
-            self.run_export_logs(),
-        ]
+        phase_results: List[PhaseResult] = []
+        for runner in (self.run_extract_streams, self.run_select_frames):
+            result = runner()
+            phase_results.append(result)
+            if result.status == "error":
+                break
+
         overall_status = "ok"
-        if any(result.status == "todo" for result in phase_results):
-            overall_status = "todo"
         if any(result.status == "error" for result in phase_results):
             overall_status = "error"
         summary = PhaseResult(
             phase="run_full_pipeline",
             status=overall_status,
-            message="Pipeline scaffold completed with per-phase details logged to work/logs.",
+            message="Phase 1 completed through extraction and frame selection.",
             details={"phases": [result.to_dict() for result in phase_results]},
         )
         self.logs.write_summary(self.config.summary_log_path, summary.to_dict())
