@@ -17,6 +17,7 @@ import logging
 import math
 import shutil
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -192,6 +193,14 @@ class PipelineConfig:
     rig_relative_rotation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     use_builtin_reduce_overlap: bool = False
     realign_after_overlap_reduction: bool = True
+    opencv_backend: str = "auto"
+    prefer_cuda: bool = True
+    cuda_device_index: int = 0
+    cuda_allow_fallback: bool = True
+    cuda_log_device_info: bool = True
+    cuda_use_gaussian_preblur: bool = False
+    cuda_benchmark_mode: bool = False
+    save_backend_report: bool = True
 
     @property
     def extracted_front_dir(self) -> Path:
@@ -238,6 +247,14 @@ class PipelineConfig:
         return self.log_dir / "frame_quality.csv"
 
     @property
+    def opencv_backend_report_path(self) -> Path:
+        return self.log_dir / "opencv_backend_report.json"
+
+    @property
+    def cuda_fallback_log_path(self) -> Path:
+        return self.log_dir / "cuda_fallback.log"
+
+    @property
     def mask_summary_log_path(self) -> Path:
         return self.log_dir / "mask_summary.csv"
 
@@ -276,6 +293,10 @@ class PipelineConfig:
             raise ValueError("Only blur_method='laplacian_center70' is supported in Phase 1.")
         if self.blur_threshold_front < 0 or self.blur_threshold_back < 0:
             raise ValueError("blur thresholds must be >= 0.")
+        if self.opencv_backend not in ("auto", "cpu", "cuda"):
+            raise ValueError("opencv_backend must be one of: auto, cpu, cuda.")
+        if self.cuda_device_index < 0:
+            raise ValueError("cuda_device_index must be >= 0.")
         if self.keep_rule != "either_side_ok_keep_both":
             raise ValueError("keep_rule must remain 'either_side_ok_keep_both'.")
         if self.mask_model != "yolo":
@@ -359,6 +380,300 @@ class PipelineConfig:
         if isinstance(default, Path):
             return Path(value)
         return value
+
+
+@dataclass
+class CudaCapabilityReport:
+    """Normalized runtime view of OpenCV CUDA availability and fallback state."""
+
+    opencv_version: str = ""
+    cv2_available: bool = False
+    numpy_available: bool = False
+    cuda_namespace_available: bool = False
+    cuda_device_count: int = 0
+    requested_backend: str = "auto"
+    selected_backend: str = "cpu"
+    active_backend: str = "cpu"
+    prefer_cuda: bool = True
+    cuda_allow_fallback: bool = True
+    cuda_device_index: int = 0
+    active_device_index: Optional[int] = None
+    cuda_api_available: bool = False
+    laplacian_filter_available: bool = False
+    gaussian_filter_available: bool = False
+    mean_stddev_available: bool = False
+    set_device_available: bool = False
+    get_device_available: bool = False
+    device_info_logged: bool = False
+    fallback_reasons: List[str] = field(default_factory=list)
+    fallback_events: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {key: _as_serializable(value) for key, value in asdict(self).items()}
+
+
+class OpenCVBackendManager:
+    """Resolve and report CPU/CUDA backend state for OpenCV preprocessing."""
+
+    def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
+        self.config = config
+        self.logs = logs
+        self._report = CudaCapabilityReport()
+        self._report_cached = False
+        self.active_backend = "cpu"
+        self.active_device_index: Optional[int] = None
+        self._backend_ensured = False
+
+    def detect_cuda_support(self) -> Dict[str, Any]:
+        """Inspect the current cv2 runtime for CUDA support and required symbols."""
+
+        if self._report_cached:
+            return self._report.to_dict()
+
+        report = CudaCapabilityReport(
+            opencv_version=getattr(cv2, "__version__", ""),
+            cv2_available=cv2 is not None,
+            numpy_available=np is not None,
+            requested_backend=self.config.opencv_backend,
+            selected_backend=self.active_backend,
+            active_backend=self.active_backend,
+            prefer_cuda=self.config.prefer_cuda,
+            cuda_allow_fallback=self.config.cuda_allow_fallback,
+            cuda_device_index=self.config.cuda_device_index,
+            active_device_index=self.active_device_index,
+        )
+        if cv2 is None or np is None:
+            report.warnings.append("OpenCV and numpy are required for blur evaluation.")
+            self._report = report
+            self._report_cached = True
+            return report.to_dict()
+
+        cuda_api = getattr(cv2, "cuda", None)
+        report.cuda_namespace_available = cuda_api is not None
+        if cuda_api is None:
+            report.warnings.append("cv2.cuda is not available in the current OpenCV build.")
+            self._report = report
+            self._report_cached = True
+            return report.to_dict()
+
+        report.set_device_available = hasattr(cuda_api, "setDevice")
+        report.get_device_available = hasattr(cuda_api, "getDevice")
+        report.laplacian_filter_available = hasattr(cuda_api, "createLaplacianFilter")
+        report.gaussian_filter_available = hasattr(cuda_api, "createGaussianFilter")
+        report.mean_stddev_available = hasattr(cuda_api, "meanStdDev")
+        try:
+            report.cuda_device_count = int(cuda_api.getCudaEnabledDeviceCount())
+        except Exception as exc:
+            report.warnings.append("Failed to query CUDA device count: {0}".format(exc))
+            report.cuda_device_count = 0
+
+        report.cuda_api_available = report.cuda_device_count > 0 and report.laplacian_filter_available
+        if report.cuda_device_count <= 0:
+            report.warnings.append("OpenCV reports no CUDA-enabled devices.")
+        if not report.laplacian_filter_available:
+            report.warnings.append(
+                "OpenCV CUDA image-filter bindings are unavailable; createLaplacianFilter is missing."
+            )
+            # TODO: validate whether additional OpenCV CUDA Python modules are exposed on the target Metashape build.
+        if self.config.cuda_use_gaussian_preblur and not report.gaussian_filter_available:
+            report.warnings.append(
+                "cuda_use_gaussian_preblur is enabled, but createGaussianFilter is unavailable."
+            )
+            # TODO: validate gaussian preblur availability on the current OpenCV CUDA build before enabling it by default.
+
+        self._report = report
+        self._report_cached = True
+        return report.to_dict()
+
+    def select_backend(self, config: PipelineConfig) -> str:
+        """Choose the effective backend from the runtime capabilities and config."""
+
+        self.detect_cuda_support()
+        report = self._report
+        requested = config.opencv_backend
+        report.requested_backend = requested
+        report.prefer_cuda = config.prefer_cuda
+        report.cuda_allow_fallback = config.cuda_allow_fallback
+        report.cuda_device_index = config.cuda_device_index
+
+        if requested == "cpu":
+            report.selected_backend = "cpu"
+            return "cpu"
+
+        if requested == "auto" and not config.prefer_cuda:
+            report.notes.append("prefer_cuda=False forced CPU selection while opencv_backend=auto.")
+            report.selected_backend = "cpu"
+            return "cpu"
+
+        cuda_ready = report.cuda_api_available and report.cuda_device_count > config.cuda_device_index
+        if requested == "cuda":
+            if cuda_ready:
+                report.selected_backend = "cuda"
+                return "cuda"
+            reason = self._cuda_unavailable_reason(config, report)
+            if config.cuda_allow_fallback:
+                self.record_fallback(reason, context="backend_selection", requested_backend="cuda")
+                report.selected_backend = "cpu"
+                return "cpu"
+            raise PipelineError(reason)
+
+        if requested == "auto":
+            if cuda_ready:
+                report.selected_backend = "cuda"
+                return "cuda"
+            reason = self._cuda_unavailable_reason(config, report)
+            self.record_fallback(reason, context="backend_selection", requested_backend="auto")
+            report.selected_backend = "cpu"
+            return "cpu"
+
+        raise PipelineError("Unsupported opencv_backend: {0}".format(requested))
+
+    def set_active_device(self, device_index: int) -> None:
+        """Select the requested CUDA device when the backend resolves to CUDA."""
+
+        self.detect_cuda_support()
+        cuda_api = getattr(cv2, "cuda", None)
+        if cuda_api is None or not hasattr(cuda_api, "setDevice"):
+            raise PipelineError("OpenCV CUDA device selection is unavailable in this runtime.")
+        if self._report.cuda_device_count <= device_index:
+            raise PipelineError(
+                "cuda_device_index={0} is out of range for {1} detected CUDA device(s).".format(
+                    device_index, self._report.cuda_device_count
+                )
+            )
+        try:
+            cuda_api.setDevice(device_index)
+        except Exception as exc:
+            raise PipelineError("Failed to activate CUDA device {0}: {1}".format(device_index, exc)) from exc
+        self.active_device_index = device_index
+        self._report.active_device_index = device_index
+        if self.config.cuda_log_device_info:
+            self._log_device_info(device_index)
+
+    def build_backend_report(self) -> Dict[str, Any]:
+        """Return a serializable backend report with current fallback state."""
+
+        self.detect_cuda_support()
+        self._report.active_backend = self.active_backend
+        self._report.selected_backend = self._report.selected_backend or self.active_backend
+        self._report.active_device_index = self.active_device_index
+        payload = self._report.to_dict()
+        payload["backend_report_path"] = str(self.config.opencv_backend_report_path)
+        payload["cuda_fallback_log_path"] = str(self.config.cuda_fallback_log_path)
+        payload["save_backend_report"] = self.config.save_backend_report
+        return payload
+
+    def ensure_backend(self, config: PipelineConfig) -> str:
+        """Resolve the backend once and persist a report when configured."""
+
+        if self._backend_ensured:
+            return self.active_backend
+        backend = self.select_backend(config)
+        self.active_backend = backend
+        if backend == "cuda":
+            self.set_active_device(config.cuda_device_index)
+        else:
+            self.active_device_index = None
+            self._report.active_device_index = None
+        self._report.active_backend = self.active_backend
+        self._backend_ensured = True
+        self.save_backend_report()
+        return backend
+
+    def record_fallback(
+        self,
+        reason: str,
+        context: str,
+        requested_backend: Optional[str] = None,
+        image_path: Optional[Path] = None,
+    ) -> None:
+        """Capture a fallback event and keep the latest report synchronized."""
+
+        clean_reason = str(reason).strip() or "Unknown CUDA fallback reason."
+        if clean_reason not in self._report.fallback_reasons:
+            self._report.fallback_reasons.append(clean_reason)
+        event = {
+            "context": context,
+            "reason": clean_reason,
+            "requested_backend": requested_backend or self.config.opencv_backend,
+            "image_path": str(image_path) if image_path else "",
+        }
+        self._report.fallback_events.append(event)
+        LOGGER.warning("OpenCV backend fallback [%s]: %s", context, clean_reason)
+        self.logs.append_line(
+            self.config.cuda_fallback_log_path,
+            "{0}\t{1}\t{2}".format(context, event["requested_backend"], clean_reason),
+        )
+
+    def fallback_to_cpu(self, reason: str, context: str, image_path: Optional[Path] = None) -> None:
+        """Switch the active runtime backend to CPU after a CUDA failure."""
+
+        self.record_fallback(reason, context=context, image_path=image_path)
+        self.active_backend = "cpu"
+        self.active_device_index = None
+        self._report.active_backend = "cpu"
+        self._report.selected_backend = "cpu"
+        self._report.active_device_index = None
+        self.save_backend_report()
+
+    def save_backend_report(self) -> None:
+        if self.config.save_backend_report:
+            self.logs.write_json(self.config.opencv_backend_report_path, self.build_backend_report())
+
+    @property
+    def fallback_detected(self) -> bool:
+        return bool(self._report.fallback_events)
+
+    def _cuda_unavailable_reason(self, config: PipelineConfig, report: CudaCapabilityReport) -> str:
+        if not report.cv2_available or not report.numpy_available:
+            return "OpenCV and numpy are required before CUDA selection can succeed."
+        if not report.cuda_namespace_available:
+            return "OpenCV was built without cv2.cuda support."
+        if report.cuda_device_count <= 0:
+            return "OpenCV CUDA backend requested, but no CUDA-enabled device was detected."
+        if report.cuda_device_count <= config.cuda_device_index:
+            return "cuda_device_index={0} is out of range for {1} detected CUDA device(s).".format(
+                config.cuda_device_index, report.cuda_device_count
+            )
+        if not report.laplacian_filter_available:
+            return "OpenCV CUDA backend requested, but createLaplacianFilter is unavailable in this build."
+        return "OpenCV CUDA backend requested, but the runtime is not ready for CUDA preprocessing."
+
+    def _log_device_info(self, device_index: int) -> None:
+        cuda_api = getattr(cv2, "cuda", None)
+        if cuda_api is None:
+            return
+        device_info = None
+        if hasattr(cuda_api, "DeviceInfo"):
+            try:
+                device_info = cuda_api.DeviceInfo(device_index)
+            except Exception:
+                device_info = None
+        if device_info is not None:
+            details: Dict[str, Any] = {"device_index": device_index}
+            for attr in ("name", "majorVersion", "minorVersion", "multiProcessorCount", "totalGlobalMem"):
+                if not hasattr(device_info, attr):
+                    continue
+                value = getattr(device_info, attr)
+                try:
+                    details[attr] = value() if callable(value) else value
+                except Exception:
+                    continue
+            LOGGER.info("OpenCV CUDA device info: %s", details)
+            self._report.notes.append("Logged CUDA device info for device {0}.".format(device_index))
+            self._report.device_info_logged = True
+            return
+        if hasattr(cuda_api, "printShortCudaDeviceInfo"):
+            try:
+                cuda_api.printShortCudaDeviceInfo(device_index)
+                self._report.notes.append(
+                    "Invoked OpenCV printShortCudaDeviceInfo for device {0}.".format(device_index)
+                )
+                self._report.device_info_logged = True
+            except Exception as exc:
+                self._report.warnings.append("Failed to log CUDA device info: {0}".format(exc))
 
 
 class PipelineError(RuntimeError):
@@ -510,6 +825,13 @@ class LogWriter:
         """Persist a summary document."""
 
         self.write_json(path, summary)
+
+    def append_line(self, path: Path, line: str) -> None:
+        """Append a UTF-8 text line to a log file."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("{0}\n".format(line.rstrip("\n")))
 
 
 class ConfigPersistence:
@@ -733,6 +1055,14 @@ class BlurEvaluator:
     def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
         self.config = config
         self.logs = logs
+        self.backend_manager = OpenCVBackendManager(config, logs)
+        self._last_score_metadata: Dict[str, Any] = {
+            "backend": "cpu",
+            "fallback": False,
+            "fallback_reason": "",
+            "elapsed_ms": None,
+        }
+        self._current_image_path: Optional[Path] = None
 
     def compute_center70_mask(self, image: Any) -> Any:
         """Build a circular mask centered in the image with a 70% diameter."""
@@ -747,8 +1077,8 @@ class BlurEvaluator:
         cv2.circle(mask, (width // 2, height // 2), radius, 255, thickness=-1)
         return mask
 
-    def laplacian_score(self, image: Any) -> Optional[float]:
-        """Compute Laplacian variance within the center-70-percent circle."""
+    def laplacian_score_cpu(self, image: Any) -> Optional[float]:
+        """Compute Laplacian variance on CPU within the center-70-percent circle."""
 
         self._require_cv_runtime()
         mask = self.compute_center70_mask(image)
@@ -757,6 +1087,79 @@ class BlurEvaluator:
         if masked_values.size == 0:
             raise PipelineError("Center-70-percent mask produced no pixels for blur evaluation.")
         return float(masked_values.var())
+
+    def laplacian_score_cuda(self, image: Any) -> Optional[float]:
+        """Compute Laplacian variance using OpenCV CUDA when the build exposes the required APIs."""
+
+        self._require_cv_runtime()
+        cuda_api = getattr(cv2, "cuda", None)
+        if cuda_api is None:
+            raise PipelineError("cv2.cuda is unavailable in the current OpenCV build.")
+        if not hasattr(cuda_api, "createLaplacianFilter"):
+            raise PipelineError("cv2.cuda.createLaplacianFilter is unavailable in the current OpenCV build.")
+
+        source_image = image.astype(np.float32, copy=False)
+        gpu_image = cuda_api.GpuMat()
+        gpu_image.upload(source_image)
+        gpu_working = gpu_image
+
+        if self.config.cuda_use_gaussian_preblur:
+            if not hasattr(cuda_api, "createGaussianFilter"):
+                raise PipelineError("cuda_use_gaussian_preblur requires cv2.cuda.createGaussianFilter.")
+            gaussian_filter = cuda_api.createGaussianFilter(
+                self._cv32fc1(),
+                self._cv32fc1(),
+                (3, 3),
+                0,
+            )
+            gpu_working = self._apply_cuda_filter(gaussian_filter, gpu_working)
+
+        laplacian_filter = cuda_api.createLaplacianFilter(self._cv32fc1(), self._cv32fc1(), 3)
+        gpu_laplacian = self._apply_cuda_filter(laplacian_filter, gpu_working)
+
+        mask = self.compute_center70_mask(image)
+        if hasattr(cuda_api, "meanStdDev"):
+            gpu_mask = cuda_api.GpuMat()
+            gpu_mask.upload(mask)
+            _mean, stddev = cuda_api.meanStdDev(gpu_laplacian, gpu_mask)
+            std_array = np.asarray(stddev).reshape(-1)
+            if std_array.size == 0:
+                raise PipelineError("OpenCV CUDA meanStdDev returned no values for blur evaluation.")
+            return float(std_array[0] ** 2)
+
+        laplacian = gpu_laplacian.download()
+        masked_values = laplacian[mask > 0]
+        if masked_values.size == 0:
+            raise PipelineError("Center-70-percent mask produced no pixels for CUDA blur evaluation.")
+        return float(masked_values.var())
+
+    def laplacian_score(self, image: Any) -> Optional[float]:
+        """Dispatch the configured Laplacian blur evaluation to CPU or CUDA."""
+
+        backend = self.backend_manager.ensure_backend(self.config)
+        start_time = time.perf_counter()
+        if backend == "cuda":
+            try:
+                score = self.laplacian_score_cuda(image)
+                self._set_score_metadata("cuda", False, "", start_time)
+                return score
+            except Exception as exc:
+                if not self.config.cuda_allow_fallback:
+                    raise PipelineError("CUDA blur evaluation failed with fallback disabled: {0}".format(exc)) from exc
+                reason = "CUDA blur evaluation failed; falling back to CPU: {0}".format(exc)
+                self.backend_manager.fallback_to_cpu(
+                    reason,
+                    context="laplacian_score",
+                    image_path=self._current_image_path,
+                )
+                self._log_cuda_fallback(reason)
+                score = self.laplacian_score_cpu(image)
+                self._set_score_metadata("cpu", True, reason, start_time)
+                return score
+
+        score = self.laplacian_score_cpu(image)
+        self._set_score_metadata("cpu", False, "", start_time)
+        return score
 
     def fft_blur_score(self, image: Any) -> Optional[float]:
         """Placeholder for optional FFT-based blur scoring."""
@@ -777,8 +1180,10 @@ class BlurEvaluator:
                 )
             )
 
-        front_score = self._score_image(front_path)
-        back_score = self._score_image(back_path)
+        front_result = self._score_image(front_path)
+        back_result = self._score_image(back_path)
+        front_score = float(front_result["score"])
+        back_score = float(back_result["score"])
         keep_pair = int(
             front_score >= self.config.blur_threshold_front
             or back_score >= self.config.blur_threshold_back
@@ -791,11 +1196,18 @@ class BlurEvaluator:
             "back_score": round(back_score, 4),
             "keep_pair": keep_pair,
             "better_side": self._better_side(front_score, back_score),
+            "backend_front": front_result["backend"],
+            "backend_back": back_result["backend"],
+            "fallback_front": int(bool(front_result["fallback"])),
+            "fallback_back": int(bool(back_result["fallback"])),
+            "fallback_reason_front": front_result["fallback_reason"],
+            "fallback_reason_back": back_result["fallback_reason"],
         }
 
     def select_pairs(self, front_dir: Path, back_dir: Path, out_front_dir: Path, out_back_dir: Path) -> PhaseResult:
         """Evaluate extracted pairs, keep both sides when either side passes, and log the results."""
 
+        self.ensure_backend_ready()
         pairs = self._collect_pairs(front_dir, back_dir)
 
         out_front_dir.mkdir(parents=True, exist_ok=True)
@@ -824,8 +1236,15 @@ class BlurEvaluator:
                 "back_score",
                 "keep_pair",
                 "better_side",
+                "backend_front",
+                "backend_back",
+                "fallback_front",
+                "fallback_back",
+                "fallback_reason_front",
+                "fallback_reason_back",
             ),
         )
+        self.backend_manager.save_backend_report()
         if selected_pairs == 0:
             raise PipelineError(
                 "No frame pairs met the blur thresholds. See {0}.".format(
@@ -840,6 +1259,9 @@ class BlurEvaluator:
                 "total_pairs": len(rows),
                 "selected_pairs": selected_pairs,
                 "rejected_pairs": len(rows) - selected_pairs,
+                "active_backend": self.backend_manager.active_backend,
+                "fallback_detected": self.backend_manager.fallback_detected,
+                "backend_report": self.config.opencv_backend_report_path,
             },
         )
 
@@ -860,17 +1282,25 @@ class BlurEvaluator:
 
         return index_frame_paths(directory, prefix, ".jpg")
 
-    def _score_image(self, image_path: Path) -> float:
+    def ensure_backend_ready(self) -> str:
+        """Resolve and persist the preprocessing backend before frame selection starts."""
+
+        return self.backend_manager.ensure_backend(self.config)
+
+    def _score_image(self, image_path: Path) -> Dict[str, Any]:
         """Read an image and compute the configured primary blur score."""
 
         image = self._read_grayscale_image(image_path)
+        self._current_image_path = image_path
         if self.config.blur_method == "laplacian_center70":
             score = self.laplacian_score(image)
         else:
             raise PipelineError("Unsupported blur_method: {0}".format(self.config.blur_method))
         if score is None:
             raise PipelineError("Blur score could not be computed for {0}".format(image_path))
-        return float(score)
+        result = dict(self._last_score_metadata)
+        result["score"] = float(score)
+        return result
 
     def _read_grayscale_image(self, image_path: Path) -> Any:
         """Read an image from disk as grayscale."""
@@ -892,6 +1322,47 @@ class BlurEvaluator:
     @staticmethod
     def _extract_frame_id(image_path: Path, prefix: str) -> int:
         return extract_frame_id_from_path(image_path, prefix)
+
+    def _set_score_metadata(self, backend: str, fallback: bool, fallback_reason: str, start_time: float) -> None:
+        elapsed_ms: Optional[float] = None
+        if self.config.cuda_benchmark_mode:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 4)
+        self._last_score_metadata = {
+            "backend": backend,
+            "fallback": bool(fallback),
+            "fallback_reason": fallback_reason,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def _log_cuda_fallback(self, reason: str) -> None:
+        image_label = str(self._current_image_path) if self._current_image_path else "<unknown>"
+        LOGGER.warning("%s [image=%s]", reason, image_label)
+        self.logs.append_line(
+            self.config.cuda_fallback_log_path,
+            "{0}\t{1}".format(image_label, reason),
+        )
+
+    @staticmethod
+    def _cv32fc1() -> int:
+        return int(getattr(cv2, "CV_32FC1", cv2.CV_32F))
+
+    @staticmethod
+    def _apply_cuda_filter(cuda_filter: Any, gpu_source: Any) -> Any:
+        """Run a CUDA filter while tolerating minor Python binding signature differences."""
+
+        try:
+            result = cuda_filter.apply(gpu_source)
+            if result is not None:
+                return result
+        except TypeError:
+            pass
+        gpu_destination = cv2.cuda.GpuMat()
+        try:
+            cuda_filter.apply(gpu_source, gpu_destination)
+        except Exception as exc:
+            # TODO: validate CUDA filter.apply(...) argument ordering on the target Metashape OpenCV build.
+            raise PipelineError("OpenCV CUDA filter apply() failed: {0}".format(exc)) from exc
+        return gpu_destination
 
     @staticmethod
     def _require_cv_runtime() -> None:
@@ -2022,16 +2493,21 @@ class PipelineController:
         required_logs = {
             "ffprobe.json": self.config.ffprobe_log_path.exists(),
             "frame_quality.csv": self.config.frame_quality_log_path.exists(),
+            "opencv_backend_report.json": self.config.opencv_backend_report_path.exists()
+            if self.config.save_backend_report
+            else False,
             "mask_summary.csv": self.config.mask_summary_log_path.exists(),
             "metashape_quality.csv": self.config.metashape_quality_log_path.exists(),
             "overlap_reduction.csv": self.config.overlap_reduction_log_path.exists(),
             "pipeline_summary.json": True,
             "error.log": self.config.error_log_path.exists(),
+            "cuda_fallback.log": self.config.cuda_fallback_log_path.exists(),
         }
         summary: Dict[str, Any] = {
             "config": self.config.to_dict(),
             "required_logs": required_logs,
             "existing_logs": sorted(path.name for path in self.config.log_dir.glob("*") if path.is_file()),
+            "opencv_backend": self.blur_evaluator.backend_manager.build_backend_report(),
         }
         if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
             chunk = Metashape.app.document.chunk
@@ -2268,6 +2744,7 @@ class PipelineController:
 
     def _run_export_logs_impl(self) -> PhaseResult:
         self._set_step("export_logs", "write_summary", 1, 1)
+        self.blur_evaluator.backend_manager.save_backend_report()
         summary = self.build_log_summary()
         self.logs.write_summary(self.config.summary_log_path, summary)
         return PhaseResult(
@@ -2459,6 +2936,41 @@ if QtWidgets is not None:
             )
             form.addRow("FFT Blur Threshold", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
             form.addRow("JPEG Quality", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
+            form.addRow(
+                "OpenCV Backend",
+                self._register_widget("opencv_backend", self._combo_box(("auto", "cpu", "cuda"))),
+            )
+            form.addRow(
+                "Prefer CUDA",
+                self._register_widget("prefer_cuda", QtWidgets.QCheckBox("Use CUDA first when auto is selected")),
+            )
+            form.addRow(
+                "CUDA Device Index",
+                self._register_widget("cuda_device_index", self._spin_box(0, 31)),
+            )
+            form.addRow(
+                "Allow CPU Fallback",
+                self._register_widget("cuda_allow_fallback", QtWidgets.QCheckBox("Fallback to CPU when CUDA fails")),
+            )
+            form.addRow(
+                "Log CUDA Device Info",
+                self._register_widget("cuda_log_device_info", QtWidgets.QCheckBox("Log device details on selection")),
+            )
+            form.addRow(
+                "CUDA Gaussian Preblur",
+                self._register_widget(
+                    "cuda_use_gaussian_preblur",
+                    QtWidgets.QCheckBox("Apply optional CUDA Gaussian preblur before Laplacian"),
+                ),
+            )
+            form.addRow(
+                "CUDA Benchmark Mode",
+                self._register_widget("cuda_benchmark_mode", QtWidgets.QCheckBox("Record per-image timing metadata")),
+            )
+            form.addRow(
+                "Save Backend Report",
+                self._register_widget("save_backend_report", QtWidgets.QCheckBox("Write opencv_backend_report.json")),
+            )
 
             layout.addLayout(form)
 
@@ -2570,6 +3082,10 @@ if QtWidgets is not None:
                 ("overlap_rows", "Overlap Rows"),
                 ("enabled_cameras", "Enabled Cameras"),
                 ("aligned_cameras", "Aligned Cameras"),
+                ("opencv_backend", "Current Backend"),
+                ("cuda_device_count", "CUDA Device Count"),
+                ("cuda_fallback", "Fallback Detected"),
+                ("backend_report_path", "Backend Report Path"),
             ):
                 value_label = QtWidgets.QLabel("-")
                 self._summary_labels[key] = value_label
@@ -2600,6 +3116,12 @@ if QtWidgets is not None:
 
         def _register_widget(self, name: str, widget: Any) -> Any:
             self._widgets[name] = widget
+            return widget
+
+        @staticmethod
+        def _combo_box(items: Sequence[str]) -> Any:
+            widget = QtWidgets.QComboBox()
+            widget.addItems(list(items))
             return widget
 
         @staticmethod
@@ -2646,6 +3168,14 @@ if QtWidgets is not None:
                 "" if config.fft_blur_threshold is None else str(config.fft_blur_threshold)
             )
             self._widgets["jpeg_quality"].setValue(config.jpeg_quality)
+            self._widgets["opencv_backend"].setCurrentText(config.opencv_backend)
+            self._widgets["prefer_cuda"].setChecked(config.prefer_cuda)
+            self._widgets["cuda_device_index"].setValue(config.cuda_device_index)
+            self._widgets["cuda_allow_fallback"].setChecked(config.cuda_allow_fallback)
+            self._widgets["cuda_log_device_info"].setChecked(config.cuda_log_device_info)
+            self._widgets["cuda_use_gaussian_preblur"].setChecked(config.cuda_use_gaussian_preblur)
+            self._widgets["cuda_benchmark_mode"].setChecked(config.cuda_benchmark_mode)
+            self._widgets["save_backend_report"].setChecked(config.save_backend_report)
             self._widgets["mask_classes"].setText(", ".join(config.mask_classes))
             self._widgets["mask_dilate_px"].setValue(config.mask_dilate_px)
             self._widgets["metashape_image_quality_threshold"].setValue(config.metashape_image_quality_threshold)
@@ -2675,6 +3205,14 @@ if QtWidgets is not None:
                     "blur_threshold_back": self._widgets["blur_threshold_back"].value(),
                     "fft_blur_threshold": self._parse_optional_float(self._widgets["fft_blur_threshold"].text()),
                     "jpeg_quality": self._widgets["jpeg_quality"].value(),
+                    "opencv_backend": self._widgets["opencv_backend"].currentText(),
+                    "prefer_cuda": self._widgets["prefer_cuda"].isChecked(),
+                    "cuda_device_index": self._widgets["cuda_device_index"].value(),
+                    "cuda_allow_fallback": self._widgets["cuda_allow_fallback"].isChecked(),
+                    "cuda_log_device_info": self._widgets["cuda_log_device_info"].isChecked(),
+                    "cuda_use_gaussian_preblur": self._widgets["cuda_use_gaussian_preblur"].isChecked(),
+                    "cuda_benchmark_mode": self._widgets["cuda_benchmark_mode"].isChecked(),
+                    "save_backend_report": self._widgets["save_backend_report"].isChecked(),
                     "mask_model_path": self._widgets["mask_model_path"].text().strip(),
                     "mask_classes": self._widgets["mask_classes"].text().strip(),
                     "mask_dilate_px": self._widgets["mask_dilate_px"].value(),
@@ -2761,6 +3299,7 @@ if QtWidgets is not None:
             self._set_running(True)
             try:
                 self._sync_config_from_widgets()
+                self._validate_preprocess_backend_action(action_name)
                 self.persistence.save(self.config)
                 self._set_status("info", "Running {0}...".format(action_name))
                 result = runner()
@@ -2859,6 +3398,27 @@ if QtWidgets is not None:
                 )
                 aligned_cameras = self.pipeline.aligner.aligned_camera_count(chunk)
 
+            backend_manager = self.pipeline.blur_evaluator.backend_manager
+            backend_report: Dict[str, Any] = dict(backend_manager.detect_cuda_support())
+            if self.config.opencv_backend_report_path.exists():
+                try:
+                    with self.config.opencv_backend_report_path.open("r", encoding="utf-8") as handle:
+                        saved_backend_report = json.load(handle)
+                    if isinstance(saved_backend_report, Mapping):
+                        backend_report.update(saved_backend_report)
+                except Exception as exc:
+                    self._append_log_entry(
+                        logging.WARNING,
+                        "Failed to read backend report: {0}".format(exc),
+                    )
+            has_runtime_backend = bool(backend_manager._backend_ensured)
+            current_backend = (
+                str(backend_report.get("active_backend", "cpu"))
+                if has_runtime_backend
+                else self._preview_opencv_backend(backend_report)
+            )
+            fallback_detected = "yes" if backend_report.get("fallback_events") else "no"
+
             summary_values = {
                 "selected_pairs": selected_pairs,
                 "discarded_pairs": discarded_pairs,
@@ -2868,6 +3428,10 @@ if QtWidgets is not None:
                 "overlap_rows": overlap_rows,
                 "enabled_cameras": enabled_cameras,
                 "aligned_cameras": aligned_cameras,
+                "opencv_backend": current_backend,
+                "cuda_device_count": backend_report.get("cuda_device_count", 0),
+                "cuda_fallback": fallback_detected,
+                "backend_report_path": str(self.config.opencv_backend_report_path),
             }
             for key, value in summary_values.items():
                 self._summary_labels[key].setText(str(value))
@@ -2875,6 +3439,29 @@ if QtWidgets is not None:
             summary_payload = self.pipeline.build_log_summary(extra={"gui_summary": summary_values})
             self.summary_text.setPlainText(json.dumps(summary_payload, indent=2, ensure_ascii=False))
             self._process_events()
+
+        def _validate_preprocess_backend_action(self, action_name: str) -> None:
+            if action_name not in ("run_full_pipeline", "select_frames"):
+                return
+            manager = self.pipeline.blur_evaluator.backend_manager
+            manager.detect_cuda_support()
+            if self.config.opencv_backend == "cuda" and not self.config.cuda_allow_fallback:
+                manager.select_backend(self.config)
+
+        def _preview_opencv_backend(self, backend_report: Mapping[str, Any]) -> str:
+            device_count = int(backend_report.get("cuda_device_count", 0) or 0)
+            cuda_ready = bool(backend_report.get("cuda_api_available")) and device_count > self.config.cuda_device_index
+            if self.config.opencv_backend == "cpu":
+                return "cpu"
+            if self.config.opencv_backend == "cuda":
+                if cuda_ready:
+                    return "cuda"
+                if self.config.cuda_allow_fallback:
+                    return "cpu (fallback)"
+                return "cuda unavailable"
+            if self.config.prefer_cuda and cuda_ready:
+                return "cuda"
+            return "cpu"
 
         @staticmethod
         def _count_csv_rows(path: Path) -> int:
