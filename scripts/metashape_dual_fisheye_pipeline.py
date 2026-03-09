@@ -16,7 +16,6 @@ import logging
 import math
 import shutil
 import subprocess
-import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -60,6 +59,36 @@ def _as_serializable(value: Any) -> Any:
     if isinstance(value, tuple):
         return list(value)
     return value
+
+
+def _read_image_with_unicode_path(image_path: Path, flags: int) -> Any:
+    """Read an image without relying on OpenCV path Unicode handling."""
+
+    if cv2 is None or np is None:
+        raise PipelineError("OpenCV and numpy are required for image IO.")
+    try:
+        encoded_bytes = np.fromfile(str(image_path), dtype=np.uint8)
+    except OSError as exc:
+        raise PipelineError("Failed to read image bytes: {0}".format(image_path)) from exc
+    if encoded_bytes.size == 0:
+        return None
+    return cv2.imdecode(encoded_bytes, flags)
+
+
+def _write_image_with_unicode_path(image_path: Path, image: Any) -> None:
+    """Write an image without relying on OpenCV path Unicode handling."""
+
+    if cv2 is None or np is None:
+        raise PipelineError("OpenCV and numpy are required for image IO.")
+    suffix = image_path.suffix or ".png"
+    ok, encoded = cv2.imencode(suffix, image)
+    if not ok:
+        raise PipelineError("Failed to encode image for writing: {0}".format(image_path))
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image_path.write_bytes(encoded.tobytes())
+    except OSError as exc:
+        raise PipelineError("Failed to write image file: {0}".format(image_path)) from exc
 
 
 @dataclass
@@ -425,8 +454,10 @@ class FFmpegExtractor:
 
         streams = payload.get("streams", [])
         video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
-        if len(video_streams) < 2:
-            raise PipelineError("Expected a 2-stream MP4, but found fewer than 2 video streams.")
+        if len(video_streams) != 2:
+            raise PipelineError(
+                "Expected a 2-stream MP4, but found {0} video streams.".format(len(video_streams))
+            )
         for stream_index, side in (
             (self.config.front_stream_index, "front"),
             (self.config.back_stream_index, "back"),
@@ -700,7 +731,7 @@ class BlurEvaluator:
         """Read an image from disk as grayscale."""
 
         self._require_cv_runtime()
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        image = _read_image_with_unicode_path(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise PipelineError("Failed to read image for blur evaluation: {0}".format(image_path))
         return image
@@ -756,7 +787,7 @@ class MaskGenerator:
         """Run YOLO segmentation and return a binary mask summary."""
 
         self._require_cv_runtime()
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image = _read_image_with_unicode_path(image_path, cv2.IMREAD_COLOR)
         if image is None:
             raise PipelineError("Failed to read image for mask generation: {0}".format(image_path))
 
@@ -827,10 +858,8 @@ class MaskGenerator:
         """Persist a binary PNG mask to disk."""
 
         self._require_cv_runtime()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
         mask_to_save = np.where(mask > 0, 255, 0).astype(np.uint8)
-        if not cv2.imwrite(str(out_path), mask_to_save):
-            raise PipelineError("Failed to save mask PNG: {0}".format(out_path))
+        _write_image_with_unicode_path(out_path, mask_to_save)
 
     def process_image(
         self,
@@ -1204,40 +1233,63 @@ class MetashapeAligner:
 
         chunk.analyzeImages(filter_mask=True)
 
-    def disable_low_quality_cameras(self, chunk: Any, threshold: float = 0.5) -> int:
-        """Disable cameras whose Image/Quality falls below threshold."""
+    def disable_low_quality_cameras(
+        self,
+        chunk: Any,
+        threshold: float = 0.5,
+    ) -> Tuple[int, Dict[str, Dict[str, Any]]]:
+        """Disable station pairs only when all measured sides fall below threshold."""
 
+        decisions = self._quality_decisions_by_camera(chunk, threshold)
         disabled = 0
         for camera in getattr(chunk, "cameras", []):
-            quality = self.camera_quality(camera)
-            if quality is None:
+            camera_label = getattr(camera, "label", "")
+            decision = decisions.get(camera_label)
+            if decision is None or not decision.get("disable_pair"):
                 continue
-            if quality < threshold:
-                if not getattr(camera, "enabled", True):
-                    continue
-                camera.enabled = False
-                disabled += 1
-        return disabled
+            if not getattr(camera, "enabled", True):
+                continue
+            camera.enabled = False
+            disabled += 1
+        return disabled, decisions
 
-    def export_quality_log(self, chunk: Any, csv_path: Path) -> None:
+    def export_quality_log(
+        self,
+        chunk: Any,
+        csv_path: Path,
+        quality_decisions: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> None:
         """Export current Metashape quality metadata."""
 
         rows: List[Dict[str, Any]] = []
         for camera in getattr(chunk, "cameras", []):
+            camera_label = getattr(camera, "label", "")
+            decision = quality_decisions.get(camera_label, {}) if quality_decisions else {}
             rows.append(
                 {
-                    "camera_label": getattr(camera, "label", ""),
+                    "camera_label": camera_label,
                     "frame_id": self._frame_id_for_camera(camera),
                     "camera_side": self._side_for_camera(camera),
                     "enabled": getattr(camera, "enabled", True),
                     "aligned": self.camera_is_aligned(camera),
                     "image_quality": getattr(camera, "meta", {}).get("Image/Quality", ""),
+                    "quality_keep_rule": decision.get("quality_keep_rule", ""),
+                    "disabled_reason": decision.get("disabled_reason", ""),
                 }
             )
         self.logs.write_csv(
             csv_path,
             rows,
-            headers=("camera_label", "frame_id", "camera_side", "enabled", "aligned", "image_quality"),
+            headers=(
+                "camera_label",
+                "frame_id",
+                "camera_side",
+                "enabled",
+                "aligned",
+                "image_quality",
+                "quality_keep_rule",
+                "disabled_reason",
+            ),
         )
 
     def match_photos(self, chunk: Any, config: PipelineConfig, reset_matches: bool = False) -> None:
@@ -1281,14 +1333,16 @@ class MetashapeAligner:
             return PhaseResult("align", "skipped", "Active chunk has no cameras to align.", {})
 
         self.analyze_image_quality(chunk)
-        disabled_count = self.disable_low_quality_cameras(chunk, threshold=self.config.metashape_image_quality_threshold)
-        self.export_quality_log(chunk, self.config.metashape_quality_log_path)
+        disabled_count, quality_decisions = self.disable_low_quality_cameras(
+            chunk, threshold=self.config.metashape_image_quality_threshold
+        )
+        self.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
         enabled_camera_count = sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True))
         if enabled_camera_count < 2:
             raise PipelineError("Fewer than two enabled cameras remain after Image/Quality filtering.")
         self.match_photos(chunk, self.config)
         self.align_cameras(chunk)
-        self.export_quality_log(chunk, self.config.metashape_quality_log_path)
+        self.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
         save_metashape_document(self.config)
         return PhaseResult(
             phase="align",
@@ -1302,6 +1356,52 @@ class MetashapeAligner:
                 "quality_csv": self.config.metashape_quality_log_path,
             },
         )
+
+    def _quality_decisions_by_camera(
+        self,
+        chunk: Any,
+        threshold: float,
+    ) -> Dict[str, Dict[str, Any]]:
+        stations: Dict[int, Dict[str, Any]] = {}
+        decisions: Dict[str, Dict[str, Any]] = {}
+        for camera in getattr(chunk, "cameras", []):
+            label = getattr(camera, "label", "")
+            side = camera_side_from_label(label)
+            if side is None:
+                continue
+            frame_id = extract_frame_id_from_label(label)
+            station = stations.setdefault(frame_id, {})
+            station[side] = camera
+
+        for station in stations.values():
+            cameras = list(station.values())
+            measured_qualities = [self.camera_quality(camera) for camera in cameras]
+            valid_qualities = [quality for quality in measured_qualities if quality is not None]
+            disable_pair = False
+            quality_keep_rule = ""
+            disabled_reason = ""
+
+            if len(cameras) < 2:
+                # TODO: validate how incomplete front/back stations should be handled on the current build.
+                quality_keep_rule = "keep_incomplete_station"
+            elif not valid_qualities:
+                quality_keep_rule = "keep_pair_no_quality"
+            elif len(valid_qualities) != len(cameras):
+                quality_keep_rule = "keep_pair_missing_quality"
+            elif any(quality >= threshold for quality in valid_qualities):
+                quality_keep_rule = "keep_pair_either_side_ok"
+            else:
+                disable_pair = True
+                quality_keep_rule = "disable_pair_both_below_threshold"
+                disabled_reason = "both_measured_sides_below_image_quality_threshold"
+
+            for camera in cameras:
+                decisions[getattr(camera, "label", "")] = {
+                    "disable_pair": disable_pair,
+                    "quality_keep_rule": quality_keep_rule,
+                    "disabled_reason": disabled_reason,
+                }
+        return decisions
 
     @staticmethod
     def camera_quality(camera: Any) -> Optional[float]:
@@ -1732,10 +1832,14 @@ class DualFisheyePipeline:
         if any(result.status == "error" for result in phase_results):
             overall_status = "error"
         summary_payload = self._build_log_summary({"phases": [result.to_dict() for result in phase_results]})
+        summary_message = "Phase 1 through Phase 3 completed through alignment, overlap reduction, and log export."
+        if overall_status == "error":
+            failed_phase = next((result.phase for result in phase_results if result.status == "error"), "unknown")
+            summary_message = "Phase 1 through Phase 3 stopped after an error in '{0}'.".format(failed_phase)
         summary = PhaseResult(
             phase="run_full_pipeline",
             status=overall_status,
-            message="Phase 1 through Phase 3 completed through alignment, overlap reduction, and log export.",
+            message=summary_message,
             details={"phases": summary_payload["phases"]},
         )
         self.logs.write_summary(self.config.summary_log_path, summary_payload)
@@ -1818,8 +1922,7 @@ class DualFisheyePipeline:
             LOGGER.info("%s: %s", result.phase, result.message)
             return result
         except Exception as exc:  # pragma: no cover - exercised mainly inside Metashape.
-            LOGGER.error("%s failed: %s", phase_name, exc)
-            LOGGER.debug("%s", traceback.format_exc())
+            LOGGER.exception("%s failed: %s", phase_name, exc)
             return PhaseResult(
                 phase=phase_name,
                 status="error",

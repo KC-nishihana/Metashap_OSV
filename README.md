@@ -21,7 +21,7 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - `BlurEvaluator` for center-70-percent Laplacian variance scoring and pair-aware selection
 - `MaskGenerator` for YOLO-based binary PNG mask generation with configurable dilation
 - `MetashapeImporter` for `MultiplaneLayout` photo import, fisheye sensor assignment, and per-camera mask loading from disk
-- `MetashapeAligner` for `analyzeImages(filter_mask=True)`, low-quality camera disabling, `matchPhotos(...)`, and `alignCameras(...)`
+- `MetashapeAligner` for `analyzeImages(filter_mask=True)`, pair-aware low-quality camera disabling, `matchPhotos(...)`, and `alignCameras(...)`
 - `OverlapReducer` for post-alignment redundancy filtering using distance + rotation thresholds with station-level pair preservation
 - `LogWriter` for CSV / JSON phase outputs
 - menu registration for:
@@ -45,6 +45,7 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - `MultiplaneLayout` import planning split into `build_filename_sequence()` and `build_filegroups()`
 - camera-level mask assignment via `Metashape.Mask()` + `mask.load()` + `camera.mask = mask`
 - reset-aware re-execution hooks for `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
+- Unicode-safe OpenCV image IO for non-ASCII project paths on macOS and Windows
 
 ## Current Limitations
 
@@ -110,7 +111,7 @@ Default mask-related configuration in `PipelineConfig`:
 7. `Import to Metashape` imports selected front/back pairs using `Metashape.MultiplaneLayout`
 8. All imported sensors are set to `Metashape.Sensor.Type.Fisheye`
 9. Matching mask PNGs are loaded from disk and assigned camera-by-camera
-10. `Align` runs `analyzeImages(filter_mask=True)`, disables cameras whose `Image/Quality` is below `metashape_image_quality_threshold`, writes `work/logs/metashape_quality.csv`, then calls `matchPhotos(...)` and `alignCameras(...)`
+10. `Align` runs `analyzeImages(filter_mask=True)`, keeps front/back pairs when either measured side meets `metashape_image_quality_threshold`, disables both sides only when all measured sides for the timestamp fall below threshold, writes `work/logs/metashape_quality.csv`, then calls `matchPhotos(...)` and `alignCameras(...)`
 11. `Reduce Overlap` compares adjacent aligned stations using both camera-center distance and rotation delta, disables the lower-priority redundant station pair, writes `work/logs/overlap_reduction.csv`, and can realign with `reset_matches=True` / `reset_alignment=True`
 12. `Export Logs` writes `work/logs/pipeline_summary.json` with current log presence and active chunk counts
 
@@ -123,9 +124,21 @@ For small-sample validation of the current Metashape build, first prepare 4 to 8
 For Phase 3 validation, then run `06 Align` and `07 Reduce Overlap` and confirm:
 
 - `work/logs/metashape_quality.csv` contains `Image/Quality` values and `enabled` flags
+- `work/logs/metashape_quality.csv` also records `quality_keep_rule` and any pair-level disable reason
 - `work/logs/overlap_reduction.csv` is written even when no stations are disabled
 - if redundant stations are disabled, both sides of the losing timestamp are disabled together
 - rerunning overlap cleanup can trigger `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
+
+## Windows Verification Notes
+
+When validating on Windows, check these points explicitly:
+
+- Confirm `ffprobe.exe` and `ffmpeg.exe` are visible from the Metashape Python process, not just from a separate terminal.
+- Re-run a small sample from a path containing spaces or non-ASCII characters and confirm extraction, OpenCV reads, and mask PNG writes still succeed.
+- Validate `MultiplaneLayout` with 4 to 8 front/back pairs on the current Windows Metashape build before trusting the final `filenames` / `filegroups` plan.
+- Visually confirm `Metashape.Mask()` + `mask.load()` + `camera.mask = mask` still attaches the correct front/back masks on the Windows build.
+- Re-run `06 Align` and `07 Reduce Overlap` once to confirm `matchPhotos(...)` current argument names and `alignCameras(reset_alignment=True)` are accepted on that build.
+- Verify `work/logs/error.log` captures traceback details for a forced failure, so Windows-specific runtime issues are diagnosable.
 
 Expected default paths:
 
