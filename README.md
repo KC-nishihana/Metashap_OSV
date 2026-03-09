@@ -1,6 +1,6 @@
 # Metashape Dual Fisheye Pipeline
 
-Phase 1 and Phase 2 implementation for a Metashape Professional Python pipeline that targets a dual-fisheye 2-stream MP4 workflow.
+Phase 1 through Phase 3 implementation for a Metashape Professional Python pipeline that targets a dual-fisheye 2-stream MP4 workflow.
 
 ## Source References
 
@@ -21,6 +21,8 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - `BlurEvaluator` for center-70-percent Laplacian variance scoring and pair-aware selection
 - `MaskGenerator` for YOLO-based binary PNG mask generation with configurable dilation
 - `MetashapeImporter` for `MultiplaneLayout` photo import, fisheye sensor assignment, and per-camera mask loading from disk
+- `MetashapeAligner` for `analyzeImages(filter_mask=True)`, low-quality camera disabling, `matchPhotos(...)`, and `alignCameras(...)`
+- `OverlapReducer` for post-alignment redundancy filtering using distance + rotation thresholds with station-level pair preservation
 - `LogWriter` for CSV / JSON phase outputs
 - menu registration for:
   - `Custom/DualFisheye/01 Run Full Pipeline`
@@ -39,9 +41,10 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - binary mask PNG output under:
   - `work/selected/masks/front/`
   - `work/selected/masks/back/`
-- `frame_quality.csv` and `mask_summary.csv` output under `work/logs/`
+- `frame_quality.csv`, `mask_summary.csv`, `metashape_quality.csv`, and `overlap_reduction.csv` output under `work/logs/`
 - `MultiplaneLayout` import planning split into `build_filename_sequence()` and `build_filegroups()`
 - camera-level mask assignment via `Metashape.Mask()` + `mask.load()` + `camera.mask = mask`
+- reset-aware re-execution hooks for `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
 
 ## Current Limitations
 
@@ -49,8 +52,8 @@ Later phases still keep unvalidated API behavior behind explicit `TODO` markers:
 
 - `MultiplaneLayout` `filenames` / `filegroups` validation on the current Metashape build
 - `camera.mask` assignment re-check on the current Metashape build with a small sample
-- pair-aware low-quality disabling policy
-- custom post-alignment overlap reduction
+- whether `alignCameras(reset_alignment=True)` needs additional current-build guards beyond the current implementation
+- whether `Chunk.reduceOverlap(...)` should remain optional or become part of the main workflow
 - optional rig reference handling
 
 The current revision does not assume the older `importMasks` workflow and keeps task-based bulk mask import as future optional work.
@@ -86,8 +89,11 @@ Default mask-related configuration in `PipelineConfig`:
    - `Custom/DualFisheye/03 Select Frames`
    - `Custom/DualFisheye/04 Generate Masks`
    - `Custom/DualFisheye/05 Import to Metashape`
+   - `Custom/DualFisheye/06 Align`
+   - `Custom/DualFisheye/07 Reduce Overlap`
+   - `Custom/DualFisheye/08 Export Logs`
 
-`01 Run Full Pipeline` now runs Phase 1 and Phase 2:
+`01 Run Full Pipeline` now runs Phase 1 through Phase 3:
 
 1. `ffprobe` writes `work/logs/ffprobe.json`
 2. `ffmpeg` extracts:
@@ -104,12 +110,22 @@ Default mask-related configuration in `PipelineConfig`:
 7. `Import to Metashape` imports selected front/back pairs using `Metashape.MultiplaneLayout`
 8. All imported sensors are set to `Metashape.Sensor.Type.Fisheye`
 9. Matching mask PNGs are loaded from disk and assigned camera-by-camera
+10. `Align` runs `analyzeImages(filter_mask=True)`, disables cameras whose `Image/Quality` is below `metashape_image_quality_threshold`, writes `work/logs/metashape_quality.csv`, then calls `matchPhotos(...)` and `alignCameras(...)`
+11. `Reduce Overlap` compares adjacent aligned stations using both camera-center distance and rotation delta, disables the lower-priority redundant station pair, writes `work/logs/overlap_reduction.csv`, and can realign with `reset_matches=True` / `reset_alignment=True`
+12. `Export Logs` writes `work/logs/pipeline_summary.json` with current log presence and active chunk counts
 
 For small-sample validation of the current Metashape build, first prepare 4 to 8 selected front/back pairs, run `04 Generate Masks`, then run `05 Import to Metashape` and visually confirm:
 
 - front/back ordering is preserved per `frame_id`
 - two fisheye sensors are created
 - masks appear on the expected cameras
+
+For Phase 3 validation, then run `06 Align` and `07 Reduce Overlap` and confirm:
+
+- `work/logs/metashape_quality.csv` contains `Image/Quality` values and `enabled` flags
+- `work/logs/overlap_reduction.csv` is written even when no stations are disabled
+- if redundant stations are disabled, both sides of the losing timestamp are disabled together
+- rerunning overlap cleanup can trigger `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
 
 Expected default paths:
 
@@ -125,7 +141,7 @@ Current phases produce these log outputs under `work/logs/`:
 - `ffprobe.json`
 - `frame_quality.csv`
 - `mask_summary.csv`
+- `metashape_quality.csv`
+- `overlap_reduction.csv`
 - `pipeline_summary.json`
 - `error.log`
-
-Later-phase alignment and overlap-reduction steps may create additional CSVs when those menu items are used.

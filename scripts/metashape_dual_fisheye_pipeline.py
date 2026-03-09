@@ -5,7 +5,7 @@ Current implementation scope:
 
 - Phase 1: ffprobe / ffmpeg extraction and paired frame selection.
 - Phase 2: YOLO-based mask PNG generation and MultiplaneLayout import scaffolding.
-- Logging for ffprobe JSON, frame quality CSV, mask summary CSV, and phase summaries.
+- Phase 3: image quality analysis, alignment, overlap reduction, and phase summaries.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import shutil
 import subprocess
 import traceback
@@ -111,6 +112,9 @@ class PipelineConfig:
     mask_device: Optional[str] = None
     metashape_image_quality_threshold: float = 0.5
     match_downscale: int = 1
+    generic_preselection: bool = True
+    reference_preselection: bool = False
+    keep_keypoints: bool = False
     keypoint_limit: int = 40000
     tiepoint_limit: int = 10000
     filter_stationary_points: bool = True
@@ -123,6 +127,7 @@ class PipelineConfig:
     rig_relative_location: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     rig_relative_rotation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     use_builtin_reduce_overlap: bool = False
+    realign_after_overlap_reduction: bool = True
 
     @property
     def extracted_front_dir(self) -> Path:
@@ -255,6 +260,27 @@ def extract_frame_id_from_path(image_path: Path, prefix: str) -> int:
         raise PipelineError("Invalid frame ID in filename: {0}".format(image_path.name)) from exc
 
 
+def extract_frame_id_from_label(label: str) -> int:
+    """Extract the numeric frame ID from an imported camera label."""
+
+    if not (label.startswith("F_") or label.startswith("B_")):
+        raise PipelineError("Unexpected camera label: {0}".format(label))
+    try:
+        return int(label[2:])
+    except ValueError as exc:
+        raise PipelineError("Invalid camera label frame ID: {0}".format(label)) from exc
+
+
+def camera_side_from_label(label: str) -> Optional[str]:
+    """Resolve front/back side from an imported camera label."""
+
+    if label.startswith("F_"):
+        return "front"
+    if label.startswith("B_"):
+        return "back"
+    return None
+
+
 def index_frame_paths(directory: Path, prefix: str, suffix: str) -> Dict[int, Path]:
     """Index files by frame ID for pair-aware processing."""
 
@@ -320,6 +346,19 @@ def configure_logging(config: PipelineConfig) -> None:
         LOGGER.addHandler(handler)
 
 
+def save_metashape_document(config: PipelineConfig) -> None:
+    """Persist the active Metashape document to the configured project path."""
+
+    if Metashape is None:
+        raise PipelineError("Metashape module is not available in this Python runtime.")
+    doc = Metashape.app.document
+    config.project_path.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(doc, "path", ""):
+        doc.save()
+        return
+    doc.save(str(config.project_path))
+
+
 class LogWriter:
     """CSV / JSON log writer helpers."""
 
@@ -344,6 +383,18 @@ class LogWriter:
         """Persist a summary document."""
 
         self.write_json(path, summary)
+
+
+@dataclass
+class CameraStation:
+    """Grouped front/back cameras for a single timestamp."""
+
+    frame_id: int
+    cameras: Dict[str, Any] = field(default_factory=dict)
+    blur_scores: Dict[str, Optional[float]] = field(default_factory=dict)
+
+    def station_label(self) -> str:
+        return "station_{0:06d}".format(self.frame_id)
 
 
 class FFmpegExtractor:
@@ -1063,12 +1114,8 @@ class MetashapeImporter:
     def save_document(self, doc: Any) -> None:
         """Save the project after import."""
 
-        self.config.project_path.parent.mkdir(parents=True, exist_ok=True)
-        document_path = getattr(doc, "path", "")
-        if document_path:
-            doc.save()
-            return
-        doc.save(str(self.config.project_path))
+        del doc
+        save_metashape_document(self.config)
 
     def run(self) -> PhaseResult:
         """Create or reuse a chunk, import paired images, and apply per-camera masks."""
@@ -1158,20 +1205,16 @@ class MetashapeAligner:
         chunk.analyzeImages(filter_mask=True)
 
     def disable_low_quality_cameras(self, chunk: Any, threshold: float = 0.5) -> int:
-        """Disable cameras below threshold.
-
-        The initial scaffold keeps this method available but does not call it by
-        default because pair-aware disable behavior still needs confirmation.
-        """
+        """Disable cameras whose Image/Quality falls below threshold."""
 
         disabled = 0
         for camera in getattr(chunk, "cameras", []):
-            value = camera.meta.get("Image/Quality")
-            try:
-                quality = float(value)
-            except (TypeError, ValueError):
+            quality = self.camera_quality(camera)
+            if quality is None:
                 continue
             if quality < threshold:
+                if not getattr(camera, "enabled", True):
+                    continue
                 camera.enabled = False
                 disabled += 1
         return disabled
@@ -1184,49 +1227,48 @@ class MetashapeAligner:
             rows.append(
                 {
                     "camera_label": getattr(camera, "label", ""),
+                    "frame_id": self._frame_id_for_camera(camera),
+                    "camera_side": self._side_for_camera(camera),
                     "enabled": getattr(camera, "enabled", True),
-                    "image_quality": camera.meta.get("Image/Quality", ""),
+                    "aligned": self.camera_is_aligned(camera),
+                    "image_quality": getattr(camera, "meta", {}).get("Image/Quality", ""),
                 }
             )
-        self.logs.write_csv(csv_path, rows, headers=("camera_label", "enabled", "image_quality"))
+        self.logs.write_csv(
+            csv_path,
+            rows,
+            headers=("camera_label", "frame_id", "camera_side", "enabled", "aligned", "image_quality"),
+        )
 
-    def match_photos(self, chunk: Any, config: PipelineConfig) -> None:
+    def match_photos(self, chunk: Any, config: PipelineConfig, reset_matches: bool = False) -> None:
         """Run feature matching with current argument names from the checklist."""
 
         chunk.matchPhotos(
             downscale=config.match_downscale,
-            generic_preselection=True,
-            reference_preselection=False,
+            generic_preselection=config.generic_preselection,
+            reference_preselection=config.reference_preselection,
             filter_mask=True,
             mask_tiepoints=True,
             filter_stationary_points=config.filter_stationary_points,
-            keep_keypoints=False,
+            keep_keypoints=config.keep_keypoints,
             keypoint_limit=config.keypoint_limit,
             tiepoint_limit=config.tiepoint_limit,
-            reset_matches=False,
+            reset_matches=reset_matches,
         )
 
-    def align_cameras(self, chunk: Any) -> None:
+    def align_cameras(self, chunk: Any, reset_alignment: bool = False) -> None:
         """Run initial camera alignment."""
 
-        chunk.alignCameras()
+        chunk.alignCameras(reset_alignment=reset_alignment)
 
     def realign_after_cleanup(self, chunk: Any, config: PipelineConfig) -> None:
         """Rerun alignment after overlap cleanup."""
 
-        chunk.matchPhotos(
-            downscale=config.match_downscale,
-            generic_preselection=True,
-            reference_preselection=False,
-            filter_mask=True,
-            mask_tiepoints=True,
-            filter_stationary_points=config.filter_stationary_points,
-            keep_keypoints=False,
-            keypoint_limit=config.keypoint_limit,
-            tiepoint_limit=config.tiepoint_limit,
-            reset_matches=True,
-        )
-        chunk.alignCameras(reset_alignment=True)
+        if sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)) < 2:
+            return
+        self.match_photos(chunk, config, reset_matches=True)
+        # TODO: validate alignCameras(reset_alignment=True) behavior on the current Metashape build.
+        self.align_cameras(chunk, reset_alignment=True)
 
     def run(self) -> PhaseResult:
         """Analyze quality and align the active chunk when cameras are available."""
@@ -1239,16 +1281,57 @@ class MetashapeAligner:
             return PhaseResult("align", "skipped", "Active chunk has no cameras to align.", {})
 
         self.analyze_image_quality(chunk)
+        disabled_count = self.disable_low_quality_cameras(chunk, threshold=self.config.metashape_image_quality_threshold)
         self.export_quality_log(chunk, self.config.metashape_quality_log_path)
-        # TODO: confirm pair-aware low-quality disable policy before enabling automatic camera disabling.
+        enabled_camera_count = sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True))
+        if enabled_camera_count < 2:
+            raise PipelineError("Fewer than two enabled cameras remain after Image/Quality filtering.")
         self.match_photos(chunk, self.config)
         self.align_cameras(chunk)
+        self.export_quality_log(chunk, self.config.metashape_quality_log_path)
+        save_metashape_document(self.config)
         return PhaseResult(
             phase="align",
             status="ok",
-            message="Ran image quality analysis and alignment on the active chunk.",
-            details={"camera_count": len(getattr(chunk, "cameras", []))},
+            message="Ran image quality analysis, disabled low-quality cameras, and aligned the active chunk.",
+            details={
+                "camera_count": len(getattr(chunk, "cameras", [])),
+                "enabled_camera_count": enabled_camera_count,
+                "disabled_low_quality_count": disabled_count,
+                "aligned_camera_count": self.aligned_camera_count(chunk),
+                "quality_csv": self.config.metashape_quality_log_path,
+            },
         )
+
+    @staticmethod
+    def camera_quality(camera: Any) -> Optional[float]:
+        value = getattr(camera, "meta", {}).get("Image/Quality")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def camera_is_aligned(camera: Any) -> bool:
+        return getattr(camera, "center", None) is not None and getattr(camera, "transform", None) is not None
+
+    def aligned_camera_count(self, chunk: Any) -> int:
+        return sum(1 for camera in getattr(chunk, "cameras", []) if self.camera_is_aligned(camera))
+
+    @staticmethod
+    def _frame_id_for_camera(camera: Any) -> Optional[int]:
+        label = getattr(camera, "label", "")
+        if not label:
+            return None
+        side = camera_side_from_label(label)
+        if side is None:
+            return None
+        return extract_frame_id_from_label(label)
+
+    @staticmethod
+    def _side_for_camera(camera: Any) -> str:
+        side = camera_side_from_label(getattr(camera, "label", ""))
+        return side or ""
 
     @staticmethod
     def _require_metashape() -> None:
@@ -1257,7 +1340,7 @@ class MetashapeAligner:
 
 
 class OverlapReducer:
-    """Post-alignment overlap reduction scaffold."""
+    """Post-alignment overlap reduction with station-level pair preservation."""
 
     def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
         self.config = config
@@ -1274,33 +1357,64 @@ class OverlapReducer:
         return getattr(camera, "center", None)
 
     def camera_rotation(self, camera: Any) -> Any:
-        """Return the current camera transform."""
+        """Return the current camera rotation component."""
 
-        return getattr(camera, "transform", None)
+        transform = getattr(camera, "transform", None)
+        if transform is None:
+            return None
+        if hasattr(transform, "rotation"):
+            return transform.rotation()
+        return transform
 
     def distance_between(self, cam_a: Any, cam_b: Any) -> Optional[float]:
-        """Placeholder for distance computation."""
+        """Compute translation distance from aligned camera centers."""
 
-        del cam_a
-        del cam_b
-        # TODO: compute translation distance from aligned camera centers.
-        return None
+        center_a = self.camera_center(cam_a)
+        center_b = self.camera_center(cam_b)
+        if center_a is None or center_b is None:
+            return None
+        vec_a = self._vector_xyz(center_a)
+        vec_b = self._vector_xyz(center_b)
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(vec_a, vec_b)))
 
     def angle_between(self, cam_a: Any, cam_b: Any) -> Optional[float]:
-        """Placeholder for rotation delta computation."""
+        """Compute angular delta in degrees between aligned camera rotations."""
 
-        del cam_a
-        del cam_b
-        # TODO: compute angular delta from aligned camera transforms.
-        return None
+        rotation_a = self.camera_rotation(cam_a)
+        rotation_b = self.camera_rotation(cam_b)
+        matrix_a = self._matrix3(rotation_a)
+        matrix_b = self._matrix3(rotation_b)
+        if matrix_a is None or matrix_b is None:
+            return None
+        trace = sum(
+            sum(matrix_a[row_index][column_index] * matrix_b[row_index][column_index] for column_index in range(3))
+            for row_index in range(3)
+        )
+        cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        return math.degrees(math.acos(cosine))
 
     def disable_redundant_cameras(self, chunk: Any, config: PipelineConfig) -> List[Dict[str, Any]]:
-        """Placeholder for custom overlap-reduction decisions."""
+        """Disable redundant aligned stations while preserving front/back pairing."""
 
-        del chunk
-        del config
-        # TODO: implement pair-aware redundancy filtering after pose validation.
-        return []
+        stations = self._build_stations(chunk)
+        if len(stations) < 2:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        current_station = stations[0]
+        for next_station in stations[1:]:
+            comparison = self._comparison_metrics(current_station, next_station)
+            if comparison is None:
+                current_station = next_station
+                continue
+            if not self._is_redundant(comparison, config):
+                current_station = next_station
+                continue
+
+            kept_station, disabled_station = self._choose_station_to_keep(current_station, next_station)
+            rows.extend(self._disable_station(disabled_station, kept_station, comparison))
+            current_station = kept_station
+        return rows
 
     def run_reduce_overlap_builtin(self, chunk: Any, overlap: int = 3) -> Dict[str, Any]:
         """Optionally exercise Metashape's built-in overlap reduction."""
@@ -1311,7 +1425,7 @@ class OverlapReducer:
         return {"before_count": before_count, "after_count": after_count}
 
     def run(self) -> PhaseResult:
-        """Log overlap-reduction status without assuming unvalidated behavior."""
+        """Disable redundant aligned stations and optionally realign."""
 
         self._require_metashape()
         chunk = getattr(Metashape.app.document, "chunk", None)
@@ -1319,7 +1433,19 @@ class OverlapReducer:
             return PhaseResult("reduce_overlap", "skipped", "No active chunk is available.", {})
 
         rows = self.disable_redundant_cameras(chunk, self.config)
-        details: Dict[str, Any] = {"disabled_count": len(rows)}
+        disabled_station_count = len({row["disabled_frame_id"] for row in rows}) if rows else 0
+        details: Dict[str, Any] = {
+            "disabled_camera_count": len(rows),
+            "disabled_station_count": disabled_station_count,
+            "overlap_csv": self.config.overlap_reduction_log_path,
+        }
+
+        realigned = False
+        if rows and self.config.realign_after_overlap_reduction and len(self.get_enabled_cameras(chunk)) >= 2:
+            aligner = MetashapeAligner(self.config, self.logs)
+            aligner.realign_after_cleanup(chunk, self.config)
+            realigned = True
+            details["aligned_camera_count_after_realign"] = aligner.aligned_camera_count(chunk)
 
         if self.config.use_builtin_reduce_overlap:
             # TODO: decide whether built-in reduceOverlap() should be part of the primary workflow.
@@ -1328,14 +1454,241 @@ class OverlapReducer:
         self.logs.write_csv(
             self.config.overlap_reduction_log_path,
             rows,
-            headers=("camera_label", "reason", "kept_camera_label"),
+            headers=(
+                "disabled_frame_id",
+                "disabled_station_label",
+                "camera_label",
+                "camera_side",
+                "previously_enabled",
+                "kept_frame_id",
+                "kept_station_label",
+                "kept_camera_label",
+                "distance",
+                "angle_deg",
+                "disabled_station_quality",
+                "kept_station_quality",
+                "disabled_station_blur_score",
+                "kept_station_blur_score",
+                "reason",
+            ),
         )
+        save_metashape_document(self.config)
         return PhaseResult(
             phase="reduce_overlap",
-            status="todo",
-            message="Overlap reduction scaffold logged. TODO: implement custom pose-based redundancy filtering.",
-            details=details,
+            status="ok",
+            message="Reduced redundant aligned stations using distance and rotation thresholds.",
+            details={**details, "realigned": realigned},
         )
+
+    def _build_stations(self, chunk: Any) -> List[CameraStation]:
+        blur_scores_by_frame = self._load_blur_scores_by_frame()
+        stations: Dict[int, CameraStation] = {}
+        for camera in self.get_enabled_cameras(chunk):
+            label = getattr(camera, "label", "")
+            side = camera_side_from_label(label)
+            if side is None:
+                continue
+            frame_id = extract_frame_id_from_label(label)
+            station = stations.setdefault(
+                frame_id,
+                CameraStation(frame_id=frame_id, blur_scores=blur_scores_by_frame.get(frame_id, {})),
+            )
+            station.cameras[side] = camera
+        return [station for _, station in sorted(stations.items()) if self._station_has_pose(station)]
+
+    def _load_blur_scores_by_frame(self) -> Dict[int, Dict[str, Optional[float]]]:
+        if not self.config.frame_quality_log_path.exists():
+            return {}
+        with self.config.frame_quality_log_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            scores: Dict[int, Dict[str, Optional[float]]] = {}
+            for row in reader:
+                try:
+                    frame_id = int(str(row.get("frame_id", "")).strip())
+                except ValueError:
+                    continue
+                scores[frame_id] = {
+                    "front": self._parse_float(row.get("front_score")),
+                    "back": self._parse_float(row.get("back_score")),
+                }
+        return scores
+
+    def _comparison_metrics(self, station_a: CameraStation, station_b: CameraStation) -> Optional[Dict[str, Any]]:
+        comparison_pair = self._comparison_camera_pair(station_a, station_b)
+        if comparison_pair is None:
+            return None
+        side_name, cam_a, cam_b = comparison_pair
+        distance = self.distance_between(cam_a, cam_b)
+        angle = self.angle_between(cam_a, cam_b)
+        if distance is None or angle is None:
+            return None
+        return {
+            "side": side_name,
+            "distance": distance,
+            "angle_deg": angle,
+            "camera_a_label": getattr(cam_a, "label", ""),
+            "camera_b_label": getattr(cam_b, "label", ""),
+        }
+
+    def _comparison_camera_pair(
+        self, station_a: CameraStation, station_b: CameraStation
+    ) -> Optional[Tuple[str, Any, Any]]:
+        for side_name in ("front", "back"):
+            camera_a = station_a.cameras.get(side_name)
+            camera_b = station_b.cameras.get(side_name)
+            if self._camera_has_pose(camera_a) and self._camera_has_pose(camera_b):
+                return side_name, camera_a, camera_b
+
+        fallback_a = self._best_pose_camera(station_a)
+        fallback_b = self._best_pose_camera(station_b)
+        if fallback_a is None or fallback_b is None:
+            return None
+        return "mixed", fallback_a, fallback_b
+
+    def _is_redundant(self, comparison: Mapping[str, Any], config: PipelineConfig) -> bool:
+        return (
+            float(comparison["distance"]) < config.camera_distance_threshold
+            and float(comparison["angle_deg"]) < config.camera_angle_threshold_deg
+        )
+
+    def _choose_station_to_keep(
+        self, station_a: CameraStation, station_b: CameraStation
+    ) -> Tuple[CameraStation, CameraStation]:
+        if self._station_rank(station_a) >= self._station_rank(station_b):
+            return station_a, station_b
+        return station_b, station_a
+
+    def _station_rank(self, station: CameraStation) -> Tuple[float, float, int, int]:
+        return (
+            self._station_quality(station),
+            self._station_blur_score(station),
+            self._station_pose_count(station),
+            -station.frame_id,
+        )
+
+    def _disable_station(
+        self, disabled_station: CameraStation, kept_station: CameraStation, comparison: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        kept_camera = self._best_pose_camera(kept_station)
+        kept_label = getattr(kept_camera, "label", "") if kept_camera is not None else ""
+        rows: List[Dict[str, Any]] = []
+        for side_name in ("front", "back"):
+            camera = disabled_station.cameras.get(side_name)
+            if camera is None:
+                continue
+            previously_enabled = bool(getattr(camera, "enabled", True))
+            camera.enabled = False
+            rows.append(
+                {
+                    "disabled_frame_id": disabled_station.frame_id,
+                    "disabled_station_label": disabled_station.station_label(),
+                    "camera_label": getattr(camera, "label", ""),
+                    "camera_side": side_name,
+                    "previously_enabled": previously_enabled,
+                    "kept_frame_id": kept_station.frame_id,
+                    "kept_station_label": kept_station.station_label(),
+                    "kept_camera_label": kept_label,
+                    "distance": round(float(comparison["distance"]), 6),
+                    "angle_deg": round(float(comparison["angle_deg"]), 6),
+                    "disabled_station_quality": self._score_or_blank(self._station_quality(disabled_station)),
+                    "kept_station_quality": self._score_or_blank(self._station_quality(kept_station)),
+                    "disabled_station_blur_score": self._score_or_blank(self._station_blur_score(disabled_station)),
+                    "kept_station_blur_score": self._score_or_blank(self._station_blur_score(kept_station)),
+                    "reason": "distance<{0} and angle<{1}".format(
+                        self.config.camera_distance_threshold,
+                        self.config.camera_angle_threshold_deg,
+                    ),
+                }
+            )
+        return rows
+
+    def _station_has_pose(self, station: CameraStation) -> bool:
+        return self._best_pose_camera(station) is not None
+
+    def _best_pose_camera(self, station: CameraStation) -> Optional[Any]:
+        candidates = [camera for camera in station.cameras.values() if self._camera_has_pose(camera)]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda camera: (
+                self._camera_quality(camera),
+                1 if camera_side_from_label(getattr(camera, "label", "")) == "front" else 0,
+                -extract_frame_id_from_label(getattr(camera, "label", "F_000000")),
+            ),
+        )
+
+    def _station_quality(self, station: CameraStation) -> float:
+        qualities = [self._camera_quality(camera) for camera in station.cameras.values()]
+        valid = [quality for quality in qualities if quality is not None]
+        if not valid:
+            return float("-inf")
+        return max(valid)
+
+    def _station_blur_score(self, station: CameraStation) -> float:
+        valid = [score for score in station.blur_scores.values() if score is not None]
+        if not valid:
+            return float("-inf")
+        return max(valid)
+
+    def _station_pose_count(self, station: CameraStation) -> int:
+        return sum(1 for camera in station.cameras.values() if self._camera_has_pose(camera))
+
+    @staticmethod
+    def _camera_quality(camera: Any) -> float:
+        value = MetashapeAligner.camera_quality(camera)
+        if value is None:
+            return float("-inf")
+        return value
+
+    @staticmethod
+    def _camera_has_pose(camera: Any) -> bool:
+        if camera is None:
+            return False
+        return getattr(camera, "center", None) is not None and getattr(camera, "transform", None) is not None
+
+    @staticmethod
+    def _parse_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _score_or_blank(value: float) -> Any:
+        if math.isfinite(value):
+            return round(value, 6)
+        return ""
+
+    @staticmethod
+    def _vector_xyz(vector: Any) -> Tuple[float, float, float]:
+        if hasattr(vector, "x") and hasattr(vector, "y") and hasattr(vector, "z"):
+            return float(vector.x), float(vector.y), float(vector.z)
+        if hasattr(vector, "__len__") and len(vector) >= 3:
+            return float(vector[0]), float(vector[1]), float(vector[2])
+        raise PipelineError("Could not extract XYZ coordinates from vector-like value.")
+
+    @classmethod
+    def _matrix3(cls, matrix: Any) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]]:
+        if matrix is None:
+            return None
+        rows: List[Tuple[float, float, float]] = []
+        for row_index in range(3):
+            if hasattr(matrix, "row"):
+                row = matrix.row(row_index)
+                rows.append(cls._vector_xyz(row))
+                continue
+            if hasattr(matrix, "__getitem__"):
+                rows.append(
+                    (
+                        float(matrix[row_index, 0]),
+                        float(matrix[row_index, 1]),
+                        float(matrix[row_index, 2]),
+                    )
+                )
+                continue
+            return None
+        return rows[0], rows[1], rows[2]
 
     @staticmethod
     def _require_metashape() -> None:
@@ -1358,7 +1711,7 @@ class DualFisheyePipeline:
         configure_logging(self.config)
 
     def run_full_pipeline(self) -> PhaseResult:
-        """Execute Phase 1 and Phase 2 through Metashape import."""
+        """Execute Phase 1 through Phase 3 as a single menu path."""
 
         phase_results: List[PhaseResult] = []
         for runner in (
@@ -1366,6 +1719,9 @@ class DualFisheyePipeline:
             self.run_select_frames,
             self.run_generate_masks,
             self.run_import_to_metashape,
+            self.run_align,
+            self.run_reduce_overlap,
+            self.run_export_logs,
         ):
             result = runner()
             phase_results.append(result)
@@ -1375,13 +1731,14 @@ class DualFisheyePipeline:
         overall_status = "ok"
         if any(result.status == "error" for result in phase_results):
             overall_status = "error"
+        summary_payload = self._build_log_summary({"phases": [result.to_dict() for result in phase_results]})
         summary = PhaseResult(
             phase="run_full_pipeline",
             status=overall_status,
-            message="Phase 1 and Phase 2 completed through mask generation and Metashape import.",
-            details={"phases": [result.to_dict() for result in phase_results]},
+            message="Phase 1 through Phase 3 completed through alignment, overlap reduction, and log export.",
+            details={"phases": summary_payload["phases"]},
         )
-        self.logs.write_summary(self.config.summary_log_path, summary.to_dict())
+        self.logs.write_summary(self.config.summary_log_path, summary_payload)
         return summary
 
     def run_extract_streams(self) -> PhaseResult:
@@ -1416,10 +1773,7 @@ class DualFisheyePipeline:
     def _export_logs(self) -> PhaseResult:
         """Write a simple summary snapshot of available logs."""
 
-        summary = {
-            "config": self.config.to_dict(),
-            "existing_logs": sorted(path.name for path in self.config.log_dir.glob("*") if path.is_file()),
-        }
+        summary = self._build_log_summary()
         self.logs.write_summary(self.config.summary_log_path, summary)
         return PhaseResult(
             phase="export_logs",
@@ -1427,6 +1781,32 @@ class DualFisheyePipeline:
             message="Exported the current pipeline log summary.",
             details={"summary_path": self.config.summary_log_path},
         )
+
+    def _build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        required_logs = {
+            "ffprobe.json": self.config.ffprobe_log_path.exists(),
+            "frame_quality.csv": self.config.frame_quality_log_path.exists(),
+            "mask_summary.csv": self.config.mask_summary_log_path.exists(),
+            "metashape_quality.csv": self.config.metashape_quality_log_path.exists(),
+            "overlap_reduction.csv": self.config.overlap_reduction_log_path.exists(),
+            "pipeline_summary.json": True,
+            "error.log": self.config.error_log_path.exists(),
+        }
+        summary: Dict[str, Any] = {
+            "config": self.config.to_dict(),
+            "required_logs": required_logs,
+            "existing_logs": sorted(path.name for path in self.config.log_dir.glob("*") if path.is_file()),
+        }
+        if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
+            chunk = Metashape.app.document.chunk
+            summary["active_chunk"] = {
+                "label": getattr(chunk, "label", ""),
+                "camera_count": len(getattr(chunk, "cameras", [])),
+                "enabled_camera_count": len([camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]),
+            }
+        if extra:
+            summary.update(extra)
+        return summary
 
     def _run_phase(self, callback: Any, phase_name: str) -> PhaseResult:
         """Wrap each phase with common validation and error logging."""
