@@ -1,12 +1,11 @@
 """Dual fisheye Metashape pipeline.
 
 This module is intended to be loaded from the Metashape Python runtime.
-Phase 1 implements:
+Current implementation scope:
 
-- ffprobe / ffmpeg orchestration for dual-stream extraction.
-- paired frame selection using center-70-percent Laplacian variance.
-- logging for ffprobe JSON, frame quality CSV, and phase summaries.
-- explicit TODO markers for later Metashape-specific phases.
+- Phase 1: ffprobe / ffmpeg extraction and paired frame selection.
+- Phase 2: YOLO-based mask PNG generation and MultiplaneLayout import scaffolding.
+- Logging for ffprobe JSON, frame quality CSV, mask summary CSV, and phase summaries.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import subprocess
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     import cv2  # type: ignore
@@ -35,6 +34,11 @@ try:
     import Metashape  # type: ignore
 except ImportError:  # pragma: no cover - Metashape is not available in local linting.
     Metashape = None  # type: ignore
+
+try:
+    from ultralytics import YOLO  # type: ignore
+except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
+    YOLO = None  # type: ignore
 
 
 LOGGER = logging.getLogger("dual_fisheye_pipeline")
@@ -99,8 +103,12 @@ class PipelineConfig:
     fft_blur_threshold: Optional[float] = None
     keep_rule: str = "either_side_ok_keep_both"
     mask_model: str = "yolo"
+    mask_model_path: str = "yolo11n-seg.pt"
     mask_classes: Tuple[str, ...] = ("person", "car", "truck", "bus", "motorbike")
     mask_dilate_px: int = 8
+    mask_confidence_threshold: float = 0.25
+    mask_iou_threshold: float = 0.45
+    mask_device: Optional[str] = None
     metashape_image_quality_threshold: float = 0.5
     match_downscale: int = 1
     keypoint_limit: int = 40000
@@ -114,7 +122,6 @@ class PipelineConfig:
     enable_rig_reference: bool = False
     rig_relative_location: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     rig_relative_rotation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    provisional_multiplane_import: bool = False
     use_builtin_reduce_overlap: bool = False
 
     @property
@@ -194,6 +201,18 @@ class PipelineConfig:
             raise ValueError("blur thresholds must be >= 0.")
         if self.keep_rule != "either_side_ok_keep_both":
             raise ValueError("keep_rule must remain 'either_side_ok_keep_both'.")
+        if self.mask_model != "yolo":
+            raise ValueError("mask_model must remain 'yolo' for the current implementation.")
+        if not self.mask_model_path:
+            raise ValueError("mask_model_path must be configured for YOLO-based mask generation.")
+        if not self.mask_classes:
+            raise ValueError("mask_classes must not be empty.")
+        if self.mask_dilate_px < 0:
+            raise ValueError("mask_dilate_px must be >= 0.")
+        if not 0.0 <= self.mask_confidence_threshold <= 1.0:
+            raise ValueError("mask_confidence_threshold must be between 0 and 1.")
+        if not 0.0 <= self.mask_iou_threshold <= 1.0:
+            raise ValueError("mask_iou_threshold must be between 0 and 1.")
         if require_input and not self.input_mp4.exists():
             raise FileNotFoundError("Input MP4 not found: {0}".format(self.input_mp4))
 
@@ -221,6 +240,62 @@ class PipelineConfig:
 
 class PipelineError(RuntimeError):
     """Domain-specific runtime error."""
+
+
+def extract_frame_id_from_path(image_path: Path, prefix: str) -> int:
+    """Extract the numeric frame ID from a prefixed filename."""
+
+    stem = image_path.stem
+    expected_prefix = "{0}_".format(prefix)
+    if not stem.startswith(expected_prefix):
+        raise PipelineError("Unexpected frame naming: {0}".format(image_path.name))
+    try:
+        return int(stem[len(expected_prefix) :])
+    except ValueError as exc:
+        raise PipelineError("Invalid frame ID in filename: {0}".format(image_path.name)) from exc
+
+
+def index_frame_paths(directory: Path, prefix: str, suffix: str) -> Dict[int, Path]:
+    """Index files by frame ID for pair-aware processing."""
+
+    pattern = "{0}_*{1}".format(prefix, suffix)
+    frames: Dict[int, Path] = {}
+    for image_path in sorted(directory.glob(pattern)):
+        frame_id = extract_frame_id_from_path(image_path, prefix)
+        if frame_id in frames:
+            raise PipelineError("Duplicate frame ID detected: {0}".format(image_path.name))
+        frames[frame_id] = image_path
+    return frames
+
+
+def collect_frame_pairs(
+    front_dir: Path,
+    back_dir: Path,
+    front_suffix: str = ".jpg",
+    back_suffix: str = ".jpg",
+) -> List[Tuple[int, Path, Path]]:
+    """Collect front/back files by shared frame ID while preserving pair order."""
+
+    front_files = index_frame_paths(front_dir, "F", front_suffix)
+    back_files = index_frame_paths(back_dir, "B", back_suffix)
+    if not front_files or not back_files:
+        raise PipelineError("No paired frame files found for front/back processing.")
+
+    front_ids = set(front_files)
+    back_ids = set(back_files)
+    if front_ids != back_ids:
+        missing_front = sorted(back_ids - front_ids)
+        missing_back = sorted(front_ids - back_ids)
+        raise PipelineError(
+            "Front/back frame IDs do not match. missing_front={0}, missing_back={1}".format(
+                missing_front[:5], missing_back[:5]
+            )
+        )
+
+    return [
+        (frame_id, front_files[frame_id], back_files[frame_id])
+        for frame_id in sorted(front_files)
+    ]
 
 
 def configure_logging(config: PipelineConfig) -> None:
@@ -466,8 +541,8 @@ class BlurEvaluator:
     def evaluate_pair(self, front_path: Path, back_path: Path) -> Dict[str, Any]:
         """Evaluate a front/back frame pair and apply the paired keep rule."""
 
-        front_frame_id = self._extract_frame_id(front_path, "F")
-        back_frame_id = self._extract_frame_id(back_path, "B")
+        front_frame_id = extract_frame_id_from_path(front_path, "F")
+        back_frame_id = extract_frame_id_from_path(back_path, "B")
         if front_frame_id != back_frame_id:
             raise PipelineError(
                 "Frame ID mismatch between paired images: {0} vs {1}".format(
@@ -551,34 +626,12 @@ class BlurEvaluator:
     def _collect_pairs(self, front_dir: Path, back_dir: Path) -> List[Tuple[Path, Path]]:
         """Collect and validate front/back pairs by frame ID."""
 
-        front_files = self._index_frames(front_dir, "F")
-        back_files = self._index_frames(back_dir, "B")
-        if not front_files or not back_files:
-            raise PipelineError("No extracted frames found. Run stream extraction first.")
-
-        front_ids = set(front_files)
-        back_ids = set(back_files)
-        if front_ids != back_ids:
-            missing_front = sorted(back_ids - front_ids)
-            missing_back = sorted(front_ids - back_ids)
-            raise PipelineError(
-                "Front/back frame IDs do not match. missing_front={0}, missing_back={1}".format(
-                    missing_front[:5], missing_back[:5]
-                )
-            )
-
-        return [(front_files[frame_id], back_files[frame_id]) for frame_id in sorted(front_files)]
+        return [(front_path, back_path) for _, front_path, back_path in collect_frame_pairs(front_dir, back_dir)]
 
     def _index_frames(self, directory: Path, prefix: str) -> Dict[int, Path]:
         """Index extracted JPEGs by numeric frame ID."""
 
-        frames: Dict[int, Path] = {}
-        for image_path in sorted(directory.glob("{0}_*.jpg".format(prefix))):
-            frame_id = self._extract_frame_id(image_path, prefix)
-            if frame_id in frames:
-                raise PipelineError("Duplicate frame ID detected: {0}".format(image_path.name))
-            frames[frame_id] = image_path
-        return frames
+        return index_frame_paths(directory, prefix, ".jpg")
 
     def _score_image(self, image_path: Path) -> float:
         """Read an image and compute the configured primary blur score."""
@@ -611,14 +664,7 @@ class BlurEvaluator:
 
     @staticmethod
     def _extract_frame_id(image_path: Path, prefix: str) -> int:
-        stem = image_path.stem
-        expected_prefix = "{0}_".format(prefix)
-        if not stem.startswith(expected_prefix):
-            raise PipelineError("Unexpected frame naming: {0}".format(image_path.name))
-        try:
-            return int(stem[len(expected_prefix) :])
-        except ValueError as exc:
-            raise PipelineError("Invalid frame ID in filename: {0}".format(image_path.name)) from exc
+        return extract_frame_id_from_path(image_path, prefix)
 
     @staticmethod
     def _require_cv_runtime() -> None:
@@ -627,74 +673,269 @@ class BlurEvaluator:
 
 
 class MaskGenerator:
-    """Mask generation scaffold."""
+    """Generate binary mask PNGs from YOLO segmentation output."""
+
+    CLASS_NAME_ALIASES = {
+        "person": ("person",),
+        "car": ("car",),
+        "truck": ("truck",),
+        "bus": ("bus",),
+        "motorbike": ("motorbike", "motorcycle"),
+    }
 
     def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
         self.config = config
         self.logs = logs
+        self._model: Optional[Any] = None
 
-    def load_model(self) -> None:
-        """Placeholder model loader."""
+    def load_model(self) -> Any:
+        """Load the configured YOLO segmentation model once per run."""
 
-        # TODO: load YOLO or another validated detector from Metashape Python.
-        return None
+        self._require_yolo_runtime()
+        if self._model is None:
+            try:
+                self._model = YOLO(self.config.mask_model_path)
+            except Exception as exc:
+                raise PipelineError(
+                    "Failed to load YOLO model from '{0}'.".format(self.config.mask_model_path)
+                ) from exc
+        return self._model
 
-    def infer_mask(self, image_path: Path) -> Optional[Any]:
-        """Placeholder mask inference hook."""
+    def infer_mask(self, image_path: Path) -> Dict[str, Any]:
+        """Run YOLO segmentation and return a binary mask summary."""
 
-        # TODO: run detector inference and return a binary mask image.
-        return None
+        self._require_cv_runtime()
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise PipelineError("Failed to read image for mask generation: {0}".format(image_path))
+
+        model = self.load_model()
+        predict_kwargs: Dict[str, Any] = {
+            "source": str(image_path),
+            "verbose": False,
+            "conf": self.config.mask_confidence_threshold,
+            "iou": self.config.mask_iou_threshold,
+        }
+        if self.config.mask_device:
+            predict_kwargs["device"] = self.config.mask_device
+
+        try:
+            results = model.predict(**predict_kwargs)
+        except Exception as exc:
+            raise PipelineError("YOLO inference failed for {0}.".format(image_path.name)) from exc
+        if not results:
+            raise PipelineError("YOLO did not return a result for {0}.".format(image_path.name))
+
+        result = results[0]
+        class_names = self._class_name_map(getattr(result, "names", {}))
+        target_class_ids = self._target_class_ids(class_names)
+        binary_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        target_classes: List[str] = []
+        detection_count = 0
+
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or getattr(boxes, "cls", None) is None:
+            return self._mask_result(binary_mask, detection_count, target_classes)
+
+        selected_indexes = self._selected_detection_indexes(boxes.cls, target_class_ids)
+        masks = getattr(result, "masks", None)
+        if selected_indexes and masks is None:
+            raise PipelineError(
+                "YOLO result for {0} does not include segmentation masks. Use segmentation weights.".format(
+                    image_path.name
+                )
+            )
+
+        mask_data = getattr(masks, "data", None) if masks is not None else None
+        if mask_data is not None:
+            class_ids = self._to_list(boxes.cls)
+            for detection_index in selected_indexes:
+                detection_mask = self._mask_array(mask_data[detection_index], image.shape[:2])
+                binary_mask = np.maximum(binary_mask, detection_mask)
+                class_id = int(class_ids[detection_index])
+                resolved_name = target_class_ids.get(class_id, "")
+                if resolved_name:
+                    target_classes.append(resolved_name)
+                detection_count += 1
+
+        if np.any(binary_mask):
+            binary_mask = self.dilate_mask(binary_mask, self.config.mask_dilate_px)
+        return self._mask_result(binary_mask, detection_count, target_classes)
 
     def dilate_mask(self, mask: Any, px: int) -> Any:
-        """Placeholder dilation hook."""
+        """Dilate a binary mask with an elliptical kernel."""
 
-        # TODO: apply dilation after binary mask generation.
-        return mask
+        self._require_cv_runtime()
+        if px <= 0:
+            return mask
+        kernel_size = px * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        return cv2.dilate(mask, kernel, iterations=1)
 
     def save_mask(self, mask: Any, out_path: Path) -> None:
-        """Placeholder mask persistence hook."""
+        """Persist a binary PNG mask to disk."""
 
-        # TODO: write binary PNG masks to disk once inference output is defined.
-        del mask
-        del out_path
+        self._require_cv_runtime()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        mask_to_save = np.where(mask > 0, 255, 0).astype(np.uint8)
+        if not cv2.imwrite(str(out_path), mask_to_save):
+            raise PipelineError("Failed to save mask PNG: {0}".format(out_path))
 
-    def process_directory(self, image_dir: Path, out_mask_dir: Path, camera_side: str) -> List[Dict[str, Any]]:
-        """Enumerate images and emit TODO rows without creating masks yet."""
+    def process_image(
+        self,
+        frame_id: int,
+        image_path: Path,
+        out_mask_dir: Path,
+        camera_side: str,
+    ) -> Dict[str, Any]:
+        """Generate and save the mask for a single selected image."""
 
-        out_mask_dir.mkdir(parents=True, exist_ok=True)
-        rows: List[Dict[str, Any]] = []
-        for image_path in sorted(image_dir.glob("*.jpg")):
-            rows.append(
-                {
-                    "camera_side": camera_side,
-                    "image_path": image_path.name,
-                    "mask_path": "",
-                    "status": "TODO",
-                }
-            )
-        return rows
+        result = self.infer_mask(image_path)
+        mask_path = out_mask_dir / "{0}.png".format(image_path.stem)
+        self.save_mask(result["mask"], mask_path)
+        return {
+            "frame_id": frame_id,
+            "camera_side": camera_side,
+            "image_path": image_path.name,
+            "mask_path": str(mask_path),
+            "status": "ok" if result["detection_count"] else "ok_blank",
+            "target_detections": result["detection_count"],
+            "target_classes": ",".join(result["target_classes"]),
+            "masked_pixels": result["masked_pixels"],
+            "dilate_px": self.config.mask_dilate_px,
+        }
 
     def run(self) -> PhaseResult:
-        """Log the pending mask-generation workload."""
+        """Generate binary mask PNGs for each selected front/back pair."""
+
+        pairs = collect_frame_pairs(self.config.selected_front_dir, self.config.selected_back_dir)
+        self._clear_directory(self.config.mask_front_dir, "F_*.png")
+        self._clear_directory(self.config.mask_back_dir, "B_*.png")
 
         rows: List[Dict[str, Any]] = []
-        rows.extend(self.process_directory(self.config.selected_front_dir, self.config.mask_front_dir, "front"))
-        rows.extend(self.process_directory(self.config.selected_back_dir, self.config.mask_back_dir, "back"))
+        masked_images = 0
+        for frame_id, front_path, back_path in pairs:
+            front_row = self.process_image(frame_id, front_path, self.config.mask_front_dir, "front")
+            back_row = self.process_image(frame_id, back_path, self.config.mask_back_dir, "back")
+            rows.extend((front_row, back_row))
+            if front_row["masked_pixels"] > 0:
+                masked_images += 1
+            if back_row["masked_pixels"] > 0:
+                masked_images += 1
+
         self.logs.write_csv(
             self.config.mask_summary_log_path,
             rows,
-            headers=("camera_side", "image_path", "mask_path", "status"),
+            headers=(
+                "frame_id",
+                "camera_side",
+                "image_path",
+                "mask_path",
+                "status",
+                "target_detections",
+                "target_classes",
+                "masked_pixels",
+                "dilate_px",
+            ),
         )
         return PhaseResult(
             phase="generate_masks",
-            status="todo",
-            message="Mask generation scaffold created. TODO: attach detector-backed mask PNG output.",
-            details={"image_count": len(rows)},
+            status="ok",
+            message="Generated binary mask PNGs for selected front/back frame pairs.",
+            details={
+                "pair_count": len(pairs),
+                "image_count": len(rows),
+                "masked_image_count": masked_images,
+                "mask_summary_csv": self.config.mask_summary_log_path,
+            },
         )
+
+    @staticmethod
+    def _clear_directory(directory: Path, pattern: str) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for old_file in directory.glob(pattern):
+            old_file.unlink()
+
+    @classmethod
+    def _canonical_mask_class(cls, class_name: str) -> str:
+        normalized_name = str(class_name).strip().lower()
+        for canonical_name, aliases in cls.CLASS_NAME_ALIASES.items():
+            if normalized_name in aliases:
+                return canonical_name
+        return normalized_name
+
+    def _normalized_target_classes(self) -> Set[str]:
+        return {self._canonical_mask_class(name) for name in self.config.mask_classes}
+
+    @staticmethod
+    def _class_name_map(names: Any) -> Dict[int, str]:
+        if isinstance(names, dict):
+            return {int(index): str(name) for index, name in names.items()}
+        if isinstance(names, (list, tuple)):
+            return {index: str(name) for index, name in enumerate(names)}
+        return {}
+
+    def _target_class_ids(self, class_names: Mapping[int, str]) -> Dict[int, str]:
+        selected_classes = self._normalized_target_classes()
+        resolved: Dict[int, str] = {}
+        for class_id, class_name in class_names.items():
+            canonical_name = self._canonical_mask_class(class_name)
+            if canonical_name in selected_classes:
+                resolved[class_id] = canonical_name
+        return resolved
+
+    def _selected_detection_indexes(self, class_ids_tensor: Any, target_class_ids: Mapping[int, str]) -> List[int]:
+        selected_indexes: List[int] = []
+        for detection_index, class_id in enumerate(self._to_list(class_ids_tensor)):
+            if int(class_id) in target_class_ids:
+                selected_indexes.append(detection_index)
+        return selected_indexes
+
+    @staticmethod
+    def _to_list(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            return list(value.tolist())
+        return list(value)
+
+    @staticmethod
+    def _mask_array(mask_tensor: Any, shape: Tuple[int, int]) -> Any:
+        mask_array = mask_tensor
+        if hasattr(mask_array, "cpu"):
+            mask_array = mask_array.cpu()
+        if hasattr(mask_array, "numpy"):
+            mask_array = mask_array.numpy()
+        mask_array = np.where(mask_array > 0.5, 255, 0).astype(np.uint8)
+        if mask_array.shape != shape:
+            mask_array = cv2.resize(mask_array, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        return mask_array
+
+    @staticmethod
+    def _mask_result(mask: Any, detection_count: int, target_classes: Sequence[str]) -> Dict[str, Any]:
+        unique_classes = sorted(set(class_name for class_name in target_classes if class_name))
+        return {
+            "mask": np.where(mask > 0, 255, 0).astype(np.uint8),
+            "detection_count": detection_count,
+            "target_classes": unique_classes,
+            "masked_pixels": int(np.count_nonzero(mask)),
+        }
+
+    @staticmethod
+    def _require_cv_runtime() -> None:
+        if cv2 is None or np is None:
+            raise PipelineError("OpenCV and numpy are required for mask generation.")
+
+    @staticmethod
+    def _require_yolo_runtime() -> None:
+        if YOLO is None:
+            raise PipelineError(
+                "Ultralytics YOLO is not available in this Python runtime. Install it in Metashape Python."
+            )
 
 
 class MetashapeImporter:
-    """Metashape import scaffold with localized TODOs for unvalidated API behavior."""
+    """Import paired front/back images into Metashape and apply camera-level masks."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -710,32 +951,22 @@ class MetashapeImporter:
         return chunk
 
     def build_filename_sequence(self, front_dir: Path, back_dir: Path) -> List[str]:
-        """Build a provisional front/back filename sequence."""
-
-        front_files = sorted(front_dir.glob("F_*.jpg"))
-        back_files = sorted(back_dir.glob("B_*.jpg"))
-        if len(front_files) != len(back_files):
-            raise PipelineError("Selected front/back frame counts do not match.")
+        """Build an interleaved front/back filename sequence for MultiplaneLayout."""
 
         filenames: List[str] = []
-        for front_path, back_path in zip(front_files, back_files):
+        for _, front_path, back_path in collect_frame_pairs(front_dir, back_dir):
             filenames.extend([str(front_path), str(back_path)])
         return filenames
 
     def build_filegroups(self, pair_count: int) -> List[int]:
-        """Build provisional filegroups for MultiplaneLayout import."""
+        """Build filegroups aligned to the interleaved filename sequence."""
 
         # TODO: validate filenames/filegroups layout on current Metashape build.
         return [2] * pair_count
 
     def import_multiplane_images(self, chunk: Any, filenames: Sequence[str], filegroups: Sequence[int]) -> None:
-        """Run provisional MultiplaneLayout import when explicitly enabled."""
+        """Import paired images using the current MultiplaneLayout plan."""
 
-        if not self.config.provisional_multiplane_import:
-            raise PipelineError(
-                "MultiplaneLayout import scaffold is prepared but disabled. "
-                "Set provisional_multiplane_import=True only after validating filenames/filegroups."
-            )
         # TODO: validate filenames/filegroups layout on current Metashape build.
         chunk.addPhotos(
             filenames=list(filenames),
@@ -757,58 +988,145 @@ class MetashapeImporter:
         # TODO: validate rig master/slave handling and relative reference assignment on current build.
         del chunk
 
-    def apply_masks_from_disk(self, chunk: Any, mask_front_dir: Path, mask_back_dir: Path) -> int:
-        """Attach per-camera masks when matching files exist on disk."""
+    def apply_masks_from_disk(self, chunk: Any, mask_front_dir: Path, mask_back_dir: Path) -> Tuple[int, List[str]]:
+        """Attach per-camera masks from disk using camera labels."""
 
         applied_count = 0
+        missing_labels: List[str] = []
         for camera in getattr(chunk, "cameras", []):
-            if not getattr(camera, "label", ""):
+            camera_label = getattr(camera, "label", "")
+            if not camera_label:
                 continue
-            mask_path = self._mask_path_for_camera(camera.label, mask_front_dir, mask_back_dir)
-            if mask_path is None or not mask_path.exists():
+            mask_path = self._mask_path_for_camera(camera_label, mask_front_dir, mask_back_dir)
+            if mask_path is None:
+                continue
+            if not mask_path.exists():
+                missing_labels.append(camera_label)
                 continue
             # TODO: re-check camera.mask assignment on the current Metashape build with a small sample.
             mask = Metashape.Mask()
             mask.load(str(mask_path))
             camera.mask = mask
             applied_count += 1
-        return applied_count
+        return applied_count, missing_labels
+
+    def build_small_sample(self, front_dir: Path, back_dir: Path, sample_pairs: int = 4) -> List[Dict[str, Any]]:
+        """Return a compact sample of the import plan for current-build validation."""
+
+        pairs = collect_frame_pairs(front_dir, back_dir)[:sample_pairs]
+        sample: List[Dict[str, Any]] = []
+        for frame_id, front_path, back_path in pairs:
+            sample.append(
+                {
+                    "frame_id": frame_id,
+                    "filenames": [str(front_path), str(back_path)],
+                    "filegroup": 2,
+                }
+            )
+        return sample
+
+    def validate_import_plan(self, filenames: Sequence[str], filegroups: Sequence[int]) -> None:
+        """Validate local consistency before calling addPhotos."""
+
+        if not filenames:
+            raise PipelineError("No filenames were built for Metashape import.")
+        if not filegroups:
+            raise PipelineError("No filegroups were built for Metashape import.")
+        if sum(filegroups) != len(filenames):
+            raise PipelineError(
+                "filenames/filegroups mismatch: len(filenames)={0}, sum(filegroups)={1}".format(
+                    len(filenames), sum(filegroups)
+                )
+            )
+
+    def expected_camera_labels(self, front_dir: Path, back_dir: Path) -> List[str]:
+        """Return the expected camera labels after import."""
+
+        labels: List[str] = []
+        for _, front_path, back_path in collect_frame_pairs(front_dir, back_dir):
+            labels.extend([front_path.stem, back_path.stem])
+        return labels
+
+    def detect_existing_import_state(self, chunk: Any, expected_labels: Sequence[str]) -> str:
+        """Protect against accidental duplicate or partial re-imports."""
+
+        if not getattr(chunk, "cameras", []):
+            return "empty"
+        existing_labels = {getattr(camera, "label", "") for camera in getattr(chunk, "cameras", [])}
+        expected_label_set = set(expected_labels)
+        if expected_label_set.issubset(existing_labels):
+            return "complete"
+        if existing_labels & expected_label_set:
+            return "partial"
+        return "other"
+
+    def save_document(self, doc: Any) -> None:
+        """Save the project after import."""
+
+        self.config.project_path.parent.mkdir(parents=True, exist_ok=True)
+        document_path = getattr(doc, "path", "")
+        if document_path:
+            doc.save()
+            return
+        doc.save(str(self.config.project_path))
 
     def run(self) -> PhaseResult:
-        """Create or reuse a chunk and keep import-specific uncertainty explicit."""
+        """Create or reuse a chunk, import paired images, and apply per-camera masks."""
 
         self._require_metashape()
         doc = Metashape.app.document
         chunk = self.create_or_get_chunk(doc, name=self.config.chunk_name)
-
-        front_files = sorted(self.config.selected_front_dir.glob("F_*.jpg"))
-        back_files = sorted(self.config.selected_back_dir.glob("B_*.jpg"))
-        if not front_files or not back_files:
-            raise PipelineError("No selected frames found. Run frame selection first.")
+        pairs = collect_frame_pairs(self.config.selected_front_dir, self.config.selected_back_dir)
 
         filenames = self.build_filename_sequence(self.config.selected_front_dir, self.config.selected_back_dir)
-        filegroups = self.build_filegroups(len(front_files))
+        filegroups = self.build_filegroups(len(pairs))
+        self.validate_import_plan(filenames, filegroups)
 
-        if self.config.provisional_multiplane_import:
-            self.import_multiplane_images(chunk, filenames, filegroups)
-            self.set_sensor_types(chunk)
-            self.apply_rig_reference(chunk, self.config)
-            applied_masks = self.apply_masks_from_disk(chunk, self.config.mask_front_dir, self.config.mask_back_dir)
-            return PhaseResult(
-                phase="import_to_metashape",
-                status="todo",
-                message="Provisional MultiplaneLayout import executed. Validate sensor grouping on the current build.",
-                details={"camera_count": len(getattr(chunk, "cameras", [])), "applied_masks": applied_masks},
+        expected_labels = self.expected_camera_labels(self.config.selected_front_dir, self.config.selected_back_dir)
+        import_state = self.detect_existing_import_state(chunk, expected_labels)
+        if import_state == "other":
+            raise PipelineError(
+                "Chunk '{0}' already contains cameras unrelated to the current selected frame set. "
+                "Use a clean chunk label before importing.".format(getattr(chunk, "label", self.config.chunk_name))
+            )
+        if import_state == "partial":
+            raise PipelineError(
+                "Chunk '{0}' already contains a partial subset of the selected camera labels. "
+                "Use a clean chunk label before re-importing.".format(getattr(chunk, "label", self.config.chunk_name))
             )
 
+        imported_now = False
+        if import_state != "complete":
+            self.import_multiplane_images(chunk, filenames, filegroups)
+            imported_now = True
+
+        self.set_sensor_types(chunk)
+        self.apply_rig_reference(chunk, self.config)
+        applied_masks, missing_labels = self.apply_masks_from_disk(
+            chunk, self.config.mask_front_dir, self.config.mask_back_dir
+        )
+        if missing_labels:
+            raise PipelineError(
+                "Mask PNGs are missing for {0} camera(s). Run Generate Masks first.".format(len(missing_labels))
+            )
+
+        self.save_document(doc)
         return PhaseResult(
             phase="import_to_metashape",
-            status="todo",
-            message=(
-                "Chunk scaffold is ready. TODO: validate filenames/filegroups on the current Metashape build "
-                "before enabling MultiplaneLayout import."
-            ),
-            details={"chunk_label": getattr(chunk, "label", self.config.chunk_name), "pair_count": len(front_files)},
+            status="ok",
+            message="Imported selected front/back pairs using MultiplaneLayout and applied per-camera masks.",
+            details={
+                "chunk_label": getattr(chunk, "label", self.config.chunk_name),
+                "pair_count": len(pairs),
+                "camera_count": len(getattr(chunk, "cameras", [])),
+                "imported_now": imported_now,
+                "applied_masks": applied_masks,
+                "sample_pairs": self.build_small_sample(
+                    self.config.selected_front_dir,
+                    self.config.selected_back_dir,
+                    sample_pairs=min(4, len(pairs)),
+                ),
+            },
         )
 
     @staticmethod
@@ -1040,10 +1358,15 @@ class DualFisheyePipeline:
         configure_logging(self.config)
 
     def run_full_pipeline(self) -> PhaseResult:
-        """Execute Phase 1 only: stream extraction and frame selection."""
+        """Execute Phase 1 and Phase 2 through Metashape import."""
 
         phase_results: List[PhaseResult] = []
-        for runner in (self.run_extract_streams, self.run_select_frames):
+        for runner in (
+            self.run_extract_streams,
+            self.run_select_frames,
+            self.run_generate_masks,
+            self.run_import_to_metashape,
+        ):
             result = runner()
             phase_results.append(result)
             if result.status == "error":
@@ -1055,7 +1378,7 @@ class DualFisheyePipeline:
         summary = PhaseResult(
             phase="run_full_pipeline",
             status=overall_status,
-            message="Phase 1 completed through extraction and frame selection.",
+            message="Phase 1 and Phase 2 completed through mask generation and Metashape import.",
             details={"phases": [result.to_dict() for result in phase_results]},
         )
         self.logs.write_summary(self.config.summary_log_path, summary.to_dict())
