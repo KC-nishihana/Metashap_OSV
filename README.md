@@ -148,6 +148,12 @@ Config persistence:
 - the GUI saves the last-used config to `work/config/last_used_config.json`
 - missing keys are filled from `PipelineConfig` defaults when loading JSON
 - `Save Config` writes the current GUI values, and each GUI run also refreshes the last-used file before execution
+- on Metashape menu execution, `__file__` may be undefined, so project-root discovery falls back in this order:
+  - `__file__`
+  - `sys.modules["__main__"].__file__`
+  - `Metashape.app.document.path` parent
+  - `Path.cwd()`
+- if those runtime hints are still unavailable, GUI startup stays alive with a safe fallback path object and defers validation until a run button is pressed
 
 Relationship to the existing menu flow:
 

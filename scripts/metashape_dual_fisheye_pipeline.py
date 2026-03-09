@@ -17,6 +17,7 @@ import logging
 import math
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -75,9 +76,114 @@ _GUI_DIALOG = None
 
 
 def _default_project_root() -> Path:
-    """Return the repository root derived from this script location."""
+    """Return the best-effort project root for Metashape and normal Python execution."""
 
-    return Path(__file__).resolve().parents[1]
+    resolved_root = _resolve_project_root()
+    return resolved_root if resolved_root is not None else _safe_fallback_path()
+
+
+def _safe_fallback_path() -> Path:
+    """Return a non-raising path object when runtime path discovery is unavailable."""
+
+    try:
+        return Path.cwd()
+    except Exception:
+        return Path(".")
+
+
+def _coerce_runtime_path(value: Any) -> Optional[Path]:
+    """Convert a runtime path-like value into a Path without assuming it is valid."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or (text.startswith("<") and text.endswith(">")):
+        return None
+    try:
+        return Path(text).expanduser().resolve(strict=False)
+    except Exception:
+        try:
+            return Path(text).expanduser()
+        except Exception:
+            return None
+
+
+def _project_root_from_script_path(script_path: Any) -> Optional[Path]:
+    """Resolve the repository root from scripts/metashape_dual_fisheye_pipeline.py."""
+
+    resolved_path = _coerce_runtime_path(script_path)
+    if resolved_path is None:
+        return None
+    parents = resolved_path.parents
+    if len(parents) >= 2:
+        return parents[1]
+    if parents:
+        return parents[0]
+    return resolved_path.parent
+
+
+def _project_root_from_main_module() -> Optional[Path]:
+    """Resolve the repository root from sys.modules['__main__'] when __file__ is absent."""
+
+    main_module = sys.modules.get("__main__")
+    if main_module is None:
+        return None
+    return _project_root_from_script_path(getattr(main_module, "__file__", None))
+
+
+def _project_root_from_metashape_document() -> Optional[Path]:
+    """Resolve the project root from the active Metashape document parent directory."""
+
+    if Metashape is None:
+        return None
+    try:
+        document = getattr(Metashape.app, "document", None)
+        document_path = getattr(document, "path", "") if document is not None else ""
+    except Exception:
+        return None
+    resolved_path = _coerce_runtime_path(document_path)
+    return resolved_path.parent if resolved_path is not None else None
+
+
+def _project_root_from_cwd() -> Optional[Path]:
+    """Resolve the project root from the current working directory."""
+
+    try:
+        return Path.cwd()
+    except Exception:
+        return None
+
+
+def _resolve_project_root() -> Optional[Path]:
+    """Resolve the project root in Metashape-friendly fallback order."""
+
+    for candidate in (
+        _project_root_from_script_path(globals().get("__file__")),
+        _project_root_from_main_module(),
+        _project_root_from_metashape_document(),
+        _project_root_from_cwd(),
+    ):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _default_input_mp4() -> Path:
+    """Return the default MP4 path without assuming __file__ exists."""
+
+    return _default_project_root() / "input" / "source.mp4"
+
+
+def _default_work_root() -> Path:
+    """Return the default work directory without assuming __file__ exists."""
+
+    return _default_project_root() / "work"
+
+
+def _default_project_path() -> Path:
+    """Return the default Metashape project file path without assuming __file__ exists."""
+
+    return _default_project_root() / "project" / "dual_fisheye_project.psx"
 
 
 def _default_last_used_config_path(project_root: Optional[Path] = None) -> Path:
@@ -152,11 +258,9 @@ class PipelineConfig:
     """Central configuration for the dual fisheye pipeline."""
 
     project_root: Path = field(default_factory=_default_project_root)
-    input_mp4: Path = field(default_factory=lambda: _default_project_root() / "input" / "source.mp4")
-    work_root: Path = field(default_factory=lambda: _default_project_root() / "work")
-    project_path: Path = field(
-        default_factory=lambda: _default_project_root() / "project" / "dual_fisheye_project.psx"
-    )
+    input_mp4: Path = field(default_factory=_default_input_mp4)
+    work_root: Path = field(default_factory=_default_work_root)
+    project_path: Path = field(default_factory=_default_project_path)
     menu_root: str = "Custom/DualFisheye"
     chunk_name: str = "Dual Fisheye"
     front_stream_index: int = 0
@@ -2420,6 +2524,7 @@ class PipelineController:
         config: PipelineConfig,
         logs: Optional[LogWriter] = None,
         progress_callback: Optional[Callable[[str, str, int, int], None]] = None,
+        initialize_logging: bool = True,
     ) -> None:
         self.config = config
         self.logs = logs or LogWriter()
@@ -2431,7 +2536,17 @@ class PipelineController:
         self.overlap_reducer = OverlapReducer(self.config, self.logs)
         self.progress_callback = progress_callback
         self._current_step = ""
+        self._logging_configured = False
+        if initialize_logging:
+            self.initialize_logging()
+
+    def initialize_logging(self) -> None:
+        """Configure file and stream logging when runtime work is about to begin."""
+
+        if self._logging_configured:
+            return
         configure_logging(self.config)
+        self._logging_configured = True
 
     def run_full_pipeline(self) -> PhaseResult:
         """Execute the full pipeline using the existing phase components."""
@@ -2764,6 +2879,7 @@ class PipelineController:
         """Wrap each phase with common validation, progress tracking, and error logging."""
 
         self._current_step = ""
+        self.initialize_logging()
         self.config.ensure_directories()
         try:
             self.config.validate(require_input=require_input)
@@ -2790,9 +2906,14 @@ class DualFisheyePipeline:
         self,
         config: Optional[PipelineConfig] = None,
         progress_callback: Optional[Callable[[str, str, int, int], None]] = None,
+        initialize_logging: bool = True,
     ) -> None:
         self.config = config or PipelineConfig()
-        self.controller = PipelineController(self.config, progress_callback=progress_callback)
+        self.controller = PipelineController(
+            self.config,
+            progress_callback=progress_callback,
+            initialize_logging=initialize_logging,
+        )
         self.logs = self.controller.logs
         self.extractor = self.controller.extractor
         self.blur_evaluator = self.controller.blur_evaluator
@@ -2838,7 +2959,7 @@ if QtWidgets is not None:
             super().__init__(parent)
             self.persistence = ConfigPersistence()
             self.config = config or PipelineConfig()
-            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+            self.pipeline = self._build_pipeline(self.config)
             self._action_buttons: List[Any] = []
             self._widgets: Dict[str, Any] = {}
             self._summary_labels: Dict[str, Any] = {}
@@ -3118,6 +3239,15 @@ if QtWidgets is not None:
             self._widgets[name] = widget
             return widget
 
+        def _build_pipeline(self, config: PipelineConfig) -> DualFisheyePipeline:
+            """Create a GUI-side pipeline without forcing runtime validation on dialog open."""
+
+            return DualFisheyePipeline(
+                config,
+                progress_callback=self._on_progress,
+                initialize_logging=False,
+            )
+
         @staticmethod
         def _combo_box(items: Sequence[str]) -> Any:
             widget = QtWidgets.QComboBox()
@@ -3230,7 +3360,7 @@ if QtWidgets is not None:
                 }
             )
             self.config = config
-            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+            self.pipeline = self._build_pipeline(self.config)
 
         def _save_last_used_config(self, silent: bool = False) -> None:
             try:
@@ -3260,7 +3390,7 @@ if QtWidgets is not None:
                     self._append_log_entry(logging.WARNING, "Failed to load last used config: {0}".format(exc))
                     continue
                 self.config = loaded
-                self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+                self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
                 self._set_status("ok", "Loaded previous config from {0}".format(candidate_path))
                 return
@@ -3281,7 +3411,7 @@ if QtWidgets is not None:
             try:
                 loaded = self.persistence.load(Path(selected_path))
                 self.config = loaded
-                self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+                self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
                 self.refresh_summary()
                 self._set_status("ok", "Loaded config from {0}".format(selected_path))
@@ -3290,7 +3420,7 @@ if QtWidgets is not None:
 
         def reset_to_default(self) -> None:
             self.config = PipelineConfig()
-            self.pipeline = DualFisheyePipeline(self.config, progress_callback=self._on_progress)
+            self.pipeline = self._build_pipeline(self.config)
             self._populate_widgets_from_config(self.config)
             self.refresh_summary()
             self._set_status("info", "Reset GUI fields to default config values.")
