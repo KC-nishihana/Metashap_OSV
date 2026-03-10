@@ -1,6 +1,6 @@
 # Metashape Dual Fisheye Pipeline
 
-Phase 1 through Phase 3 implementation for a Metashape Professional Python pipeline that targets a dual-fisheye 2-stream MP4 workflow.
+Phase 1 through Phase 3 implementation for a Metashape Professional Python pipeline that targets a dual-fisheye OSV container workflow with at least two usable video streams for the front/back pair.
 
 ## Source References
 
@@ -17,7 +17,7 @@ The checklist takes priority over older snippets or background notes when choosi
 The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` with:
 
 - `PipelineConfig` as the central dataclass for paths and processing parameters
-- `FFmpegExtractor` for `ffprobe` JSON export and front/back JPEG extraction
+- `FFmpegExtractor` for `ffprobe` JSON export, front/back stream selection, ignored-stream logging, and JPEG extraction
 - `BlurEvaluator` for center-70-percent Laplacian variance scoring and pair-aware selection
 - `OpenCVBackendManager` and `CudaCapabilityReport` for `auto` / `cpu` / `cuda` backend selection, runtime CUDA probing, fallback tracking, and backend report export
 - `MaskGenerator` for YOLO-based binary PNG mask generation with configurable dilation
@@ -37,7 +37,8 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
   - `Custom/DualFisheye/07 Reduce Overlap`
   - `Custom/DualFisheye/08 Export Logs`
 - directory creation under `work/` and `project/`
-- ffprobe / ffmpeg extraction with configurable stream indexes
+- ffprobe / ffmpeg extraction with configurable `front_stream_index` / `back_stream_index`
+- selection of two front/back streams even when the `.osv` contains three or more video streams
 - pair selection rule:
   - if `front_score >= blur_threshold_front` or `back_score >= blur_threshold_back`, keep both images for that timestamp
 - YOLO target classes initialized to `person`, `car`, `truck`, `bus`, `motorbike`
@@ -109,8 +110,8 @@ Default OpenCV backend configuration in `PipelineConfig`:
 
 1. Open Metashape Professional.
 2. Run `scripts/metashape_dual_fisheye_pipeline.py` from the Metashape Python console or scripts menu.
-3. Edit `PipelineConfig` defaults in the script if your project paths differ from the repository layout.
-4. Confirm `input/source.mp4` is a 2-stream MP4 and that `front_stream_index` / `back_stream_index` match the file.
+3. Open `Custom/DualFisheye/00 Open GUI` and select the input `.osv` container first.
+4. Confirm the selected `.osv` contains at least two usable video streams, and set `front_stream_index` / `back_stream_index` to the two streams to extract.
 5. Use one of these menu entries:
    - `Custom/DualFisheye/00 Open GUI`
    - `Custom/DualFisheye/01 Run Full Pipeline`
@@ -128,7 +129,7 @@ Default OpenCV backend configuration in `PipelineConfig`:
 
 Tabs:
 
-- `Basic`: input MP4, work folder, front/back stream index, `Run Full Pipeline`
+- `Basic`: input OSV, work folder, front/back stream index, `Run Full Pipeline`
 - `Preprocess`: frame sampling, blur thresholds, JPEG quality, OpenCV backend selection, CUDA toggles, `Extract Streams`, `Select Frames`
 - `Mask / Import`: YOLO model path, mask classes, dilation, `Generate Masks`, `Import to Metashape`
 - `Align / Reduce`: image quality threshold, keypoint/tiepoint limits, rig reference fields, `Align`, `Reduce Overlap`, `Export Logs`
@@ -136,7 +137,8 @@ Tabs:
 
 The GUI supports:
 
-- Browse buttons for input MP4, work folder, and YOLO model path
+- Browse buttons for input OSV, work folder, and YOLO model path
+- `front_stream_index` / `back_stream_index` values persisted into `PipelineConfig` and used by `probe_streams()`
 - per-phase execution and full-pipeline execution
 - colored log messages for info, warning, and error output
 - status and step progress updates during execution
@@ -148,6 +150,8 @@ Config persistence:
 - the GUI saves the last-used config to `work/config/last_used_config.json`
 - missing keys are filled from `PipelineConfig` defaults when loading JSON
 - `Save Config` writes the current GUI values, and each GUI run also refreshes the last-used file before execution
+- the input field now starts empty and no longer assumes `input/source.mp4`
+- stale `last_used_config.json` values such as old `.mp4` paths do not block GUI startup; the dialog marks them invalid until a new `.osv` is selected
 - on Metashape menu execution, `__file__` may be undefined, so project-root discovery falls back in this order:
   - `__file__`
   - `sys.modules["__main__"].__file__`
@@ -164,9 +168,11 @@ Relationship to the existing menu flow:
 `01 Run Full Pipeline` now runs Phase 1 through Phase 3:
 
 1. `ffprobe` writes `work/logs/ffprobe.json`
+   - the log includes detected video stream details, selected front/back indices, and ignored stream indices
 2. `ffmpeg` extracts:
    - `work/extracted/front_raw/F_*.jpg`
    - `work/extracted/back_raw/B_*.jpg`
+   - only the two selected front/back streams are extracted
 3. `Select Frames` scores each pair with the center-70-percent Laplacian variance
    - the score path is chosen from `auto` / `cpu` / `cuda`
    - if CUDA runtime selection or execution fails and fallback is allowed, the pipeline records the fallback and continues on CPU
@@ -218,12 +224,15 @@ On a small sample, confirm the following in order:
 
 1. Open `Custom/DualFisheye/00 Open GUI`.
 2. Edit the required fields on `Basic`, `Preprocess`, `Mask / Import`, and `Align / Reduce`.
-3. Use each `Browse` button once and confirm the chosen path is reflected in the field.
-4. Click `Save Config`, close the dialog, reopen it, and confirm the previous values reload from `work/config/last_used_config.json`.
-5. Run `Extract Streams`, `Select Frames`, `Generate Masks`, `Import to Metashape`, `Align`, and `Reduce Overlap` individually and confirm the `Logs / Summary` tab updates after each step.
-6. Run `Run Full Pipeline` and confirm the progress label, progress bar, GUI logs, and summary panel all update through completion or a visible error state.
-7. Switch `OpenCV Backend` between `Auto`, `CPU`, and `CUDA` and confirm the summary panel updates the backend preview and CUDA device count.
-8. Set `OpenCV Backend = CUDA` and `Allow CPU Fallback = off` on a CPU-only runtime and confirm the GUI stops before `Select Frames`.
+3. Use each `Browse` button once and confirm the chosen `.osv` path is reflected in the field and accepted as `Input OSV`.
+4. Click `Save Config`, close the dialog, reopen it, and confirm the previous `.osv` value reloads from `work/config/last_used_config.json`.
+5. Replace the saved input value with an old `.mp4` path in `work/config/last_used_config.json`, reopen the dialog, and confirm the GUI still opens with a visible warning.
+6. Run `Extract Streams`, `Select Frames`, `Generate Masks`, `Import to Metashape`, `Align`, and `Reduce Overlap` individually and confirm the `Logs / Summary` tab updates after each step.
+7. Run `Extract Streams` on an `.osv` with three or more video streams and confirm the GUI continues when the configured front/back indices are valid.
+8. Confirm the GUI status or log output shows the selected front/back indices and any ignored stream indices.
+9. Run `Run Full Pipeline` and confirm the progress label, progress bar, GUI logs, and summary panel all update through completion or a visible error state.
+10. Switch `OpenCV Backend` between `Auto`, `CPU`, and `CUDA` and confirm the summary panel updates the backend preview and CUDA device count.
+11. Set `OpenCV Backend = CUDA` and `Allow CPU Fallback = off` on a CPU-only runtime and confirm the GUI stops before `Select Frames`.
 
 ### OpenCV Backend Validation
 
@@ -262,7 +271,7 @@ When validating on Windows, check these points explicitly:
 
 Expected default paths:
 
-- input MP4: `input/source.mp4`
+- input OSV: not preset; select a `.osv` file in the GUI
 - work directory: `work/`
 - Metashape project path: `project/dual_fisheye_project.psx`
 - logs: `work/logs/`

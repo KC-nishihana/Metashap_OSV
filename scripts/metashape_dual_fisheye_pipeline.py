@@ -73,6 +73,9 @@ for _qt_binding, _qt_modules in (
 LOGGER = logging.getLogger("dual_fisheye_pipeline")
 _MENU_REGISTERED = False
 _GUI_DIALOG = None
+_PIPELINE_SCRIPT_NAME = "metashape_dual_fisheye_pipeline.py"
+_INPUT_OSV_SUFFIX = ".osv"
+_INPUT_OSV_PLACEHOLDER = "No OSV selected"
 
 
 def _default_project_root() -> Path:
@@ -108,18 +111,29 @@ def _coerce_runtime_path(value: Any) -> Optional[Path]:
             return None
 
 
+def _is_pipeline_script_path(path: Path) -> bool:
+    """Return True when the path points to this pipeline module file."""
+
+    if path.name != _PIPELINE_SCRIPT_NAME:
+        return False
+    return path.parent.name == "scripts"
+
+
 def _project_root_from_script_path(script_path: Any) -> Optional[Path]:
     """Resolve the repository root from scripts/metashape_dual_fisheye_pipeline.py."""
 
     resolved_path = _coerce_runtime_path(script_path)
     if resolved_path is None:
         return None
-    parents = resolved_path.parents
-    if len(parents) >= 2:
-        return parents[1]
-    if parents:
-        return parents[0]
-    return resolved_path.parent
+    if not _is_pipeline_script_path(resolved_path):
+        return None
+    return resolved_path.parent.parent
+
+
+def _project_root_from_module_code() -> Optional[Path]:
+    """Resolve the repository root from this module's compiled code filename."""
+
+    return _project_root_from_script_path(_default_project_root.__code__.co_filename)
 
 
 def _project_root_from_main_module() -> Optional[Path]:
@@ -159,6 +173,7 @@ def _resolve_project_root() -> Optional[Path]:
 
     for candidate in (
         _project_root_from_script_path(globals().get("__file__")),
+        _project_root_from_module_code(),
         _project_root_from_main_module(),
         _project_root_from_metashape_document(),
         _project_root_from_cwd(),
@@ -168,10 +183,10 @@ def _resolve_project_root() -> Optional[Path]:
     return None
 
 
-def _default_input_mp4() -> Path:
-    """Return the default MP4 path without assuming __file__ exists."""
+def _default_input_mp4() -> Optional[Path]:
+    """Return an empty default input path so GUI startup never assumes a dummy file."""
 
-    return _default_project_root() / "input" / "source.mp4"
+    return None
 
 
 def _default_work_root() -> Path:
@@ -191,6 +206,26 @@ def _default_last_used_config_path(project_root: Optional[Path] = None) -> Path:
 
     root = project_root or _default_project_root()
     return root / "work" / "config" / "last_used_config.json"
+
+
+def normalize_input_video_path(value: Any) -> Optional[Path]:
+    """Normalize a user-provided OSV path while preserving an unselected state."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return Path(text).expanduser()
+    except Exception:
+        return Path(text)
+
+
+def _path_text(value: Optional[Path]) -> str:
+    """Return a safe string for optional path values."""
+
+    return "" if value is None else str(value)
 
 
 def _as_serializable(value: Any) -> Any:
@@ -258,7 +293,7 @@ class PipelineConfig:
     """Central configuration for the dual fisheye pipeline."""
 
     project_root: Path = field(default_factory=_default_project_root)
-    input_mp4: Path = field(default_factory=_default_input_mp4)
+    input_mp4: Optional[Path] = field(default_factory=_default_input_mp4)
     work_root: Path = field(default_factory=_default_work_root)
     project_path: Path = field(default_factory=_default_project_path)
     menu_root: str = "Custom/DualFisheye"
@@ -273,7 +308,7 @@ class PipelineConfig:
     fft_blur_threshold: Optional[float] = None
     keep_rule: str = "either_side_ok_keep_both"
     mask_model: str = "yolo"
-    mask_model_path: str = "yolo11n-seg.pt"
+    mask_model_path: str = "yolo26x-seg.pt"
     mask_classes: Tuple[str, ...] = ("person", "car", "truck", "bus", "motorbike")
     mask_dilate_px: int = 8
     mask_confidence_threshold: float = 0.25
@@ -415,8 +450,34 @@ class PipelineConfig:
             raise ValueError("mask_confidence_threshold must be between 0 and 1.")
         if not 0.0 <= self.mask_iou_threshold <= 1.0:
             raise ValueError("mask_iou_threshold must be between 0 and 1.")
-        if require_input and not self.input_mp4.exists():
-            raise FileNotFoundError("Input MP4 not found: {0}".format(self.input_mp4))
+        if require_input:
+            self.require_input_video()
+
+    def input_video_validation_error(self, require_exists: bool = True) -> Optional[Exception]:
+        """Return a normalized input validation error for GUI preview and run-time checks."""
+
+        input_path = normalize_input_video_path(self.input_mp4)
+        if input_path is None:
+            return ValueError("Input OSV is not selected.")
+        if input_path.exists() and input_path.is_dir():
+            return ValueError("Input OSV must be a file, not a directory: {0}".format(input_path))
+        if input_path.suffix.lower() != _INPUT_OSV_SUFFIX:
+            return ValueError("Input file must be a .osv file.")
+        if require_exists and not input_path.exists():
+            return FileNotFoundError("Input OSV not found: {0}".format(input_path))
+        return None
+
+    def require_input_video(self) -> Path:
+        """Return the validated OSV container path for ffprobe / ffmpeg execution."""
+
+        error = self.input_video_validation_error(require_exists=True)
+        if error is not None:
+            raise error
+        input_path = normalize_input_video_path(self.input_mp4)
+        if input_path is None:
+            raise ValueError("Input OSV is not selected.")
+        self.input_mp4 = input_path
+        return input_path
 
     def ensure_directories(self) -> None:
         """Create the directory layout required by the scaffold."""
@@ -443,11 +504,14 @@ class PipelineConfig:
     def update_from_mapping(self, data: Mapping[str, Any]) -> None:
         """Update config values from a partially populated JSON-compatible mapping."""
 
+        normalized_data = dict(data)
+        if "input_mp4" not in normalized_data and "input_video" in normalized_data:
+            normalized_data["input_mp4"] = normalized_data["input_video"]
         for field_info in fields(self):
             key = field_info.name
-            if key not in data:
+            if key not in normalized_data:
                 continue
-            setattr(self, key, self._coerce_field_value(key, data[key], getattr(self, key)))
+            setattr(self, key, self._coerce_field_value(key, normalized_data[key], getattr(self, key)))
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "PipelineConfig":
@@ -461,7 +525,11 @@ class PipelineConfig:
     def _coerce_field_value(field_name: str, value: Any, default: Any) -> Any:
         if value is None:
             return None if field_name in ("fft_blur_threshold", "mask_device") else default
-        if field_name in ("project_root", "input_mp4", "work_root", "project_path"):
+        if field_name == "input_mp4":
+            return normalize_input_video_path(value)
+        if field_name in ("project_root", "work_root", "project_path"):
+            if isinstance(value, str) and not value.strip():
+                return default
             return Path(value)
         if field_name == "mask_classes":
             if isinstance(value, str):
@@ -960,7 +1028,10 @@ class ConfigPersistence:
         self._write_json(target_path, payload)
         launcher_path = _default_last_used_config_path(config.project_root)
         if launcher_path.resolve() != target_path.resolve():
-            self._write_json(launcher_path, payload)
+            try:
+                self._write_json(launcher_path, payload)
+            except OSError as exc:
+                LOGGER.warning("Failed to update launcher config cache at %s: %s", launcher_path, exc)
         return target_path
 
     @staticmethod
@@ -1004,8 +1075,8 @@ class FFmpegExtractor:
         self.config = config
         self.logs = logs
 
-    def probe_streams(self, mp4_path: Path) -> Dict[str, Any]:
-        """Inspect the input video streams via ffprobe."""
+    def probe_streams(self, input_path: Path) -> Dict[str, Any]:
+        """Inspect the input OSV container streams via ffprobe."""
 
         command = [
             "ffprobe",
@@ -1014,42 +1085,42 @@ class FFmpegExtractor:
             "-show_streams",
             "-of",
             "json",
-            str(mp4_path),
+            str(input_path),
         ]
         result = self._run_command(command)
         try:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise PipelineError("ffprobe did not return valid JSON output.") from exc
-        self.logs.write_json(self.config.ffprobe_log_path, payload)
-
         streams = payload.get("streams", [])
-        video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
-        if len(video_streams) != 2:
-            raise PipelineError(
-                "Expected a 2-stream MP4, but found {0} video streams.".format(len(video_streams))
-            )
-        for stream_index, side in (
-            (self.config.front_stream_index, "front"),
-            (self.config.back_stream_index, "back"),
-        ):
-            if stream_index >= len(video_streams):
-                raise PipelineError(
-                    "{0}_stream_index={1} is out of range for {2} detected video streams.".format(
-                        side, stream_index, len(video_streams)
-                    )
-                )
-        return payload
+        video_streams = self._build_video_stream_records(streams)
+        usable_video_streams = [stream for stream in video_streams if stream["is_usable"]]
+        self._log_video_stream_details(video_streams)
 
-    def extract_front_stream(self, mp4_path: Path, out_dir: Path, stream_index: int) -> None:
+        enriched_payload = dict(payload)
+        enriched_payload["video_streams"] = video_streams
+        enriched_payload["video_stream_count"] = len(video_streams)
+        enriched_payload["usable_video_stream_count"] = len(usable_video_streams)
+        try:
+            selection = self._select_stream_pair(video_streams, usable_video_streams)
+        except PipelineError as exc:
+            enriched_payload["stream_selection_error"] = str(exc)
+            self.logs.write_json(self.config.ffprobe_log_path, enriched_payload)
+            raise
+        enriched_payload["stream_selection"] = selection
+        self.logs.write_json(self.config.ffprobe_log_path, enriched_payload)
+        self._log_stream_selection(selection)
+        return enriched_payload
+
+    def extract_front_stream(self, input_path: Path, out_dir: Path, stream_index: int) -> None:
         """Extract the configured front stream."""
 
-        self._extract_stream(mp4_path, out_dir, stream_index, "F")
+        self._extract_stream(input_path, out_dir, stream_index, "F")
 
-    def extract_back_stream(self, mp4_path: Path, out_dir: Path, stream_index: int) -> None:
+    def extract_back_stream(self, input_path: Path, out_dir: Path, stream_index: int) -> None:
         """Extract the configured back stream."""
 
-        self._extract_stream(mp4_path, out_dir, stream_index, "B")
+        self._extract_stream(input_path, out_dir, stream_index, "B")
 
     def verify_frame_counts(self, front_dir: Path, back_dir: Path) -> Tuple[int, int]:
         """Ensure extracted front/back frame counts match."""
@@ -1071,31 +1142,86 @@ class FFmpegExtractor:
 
         self.config.validate(require_input=True)
         self.config.ensure_directories()
-        self.probe_streams(self.config.input_mp4)
+        input_path = self.config.require_input_video()
+        probe_payload = self.probe_streams(input_path)
+        front_stream_index = self.selected_stream_index_from_probe(probe_payload, "front")
+        back_stream_index = self.selected_stream_index_from_probe(probe_payload, "back")
         self.extract_front_stream(
-            self.config.input_mp4, self.config.extracted_front_dir, self.config.front_stream_index
+            input_path, self.config.extracted_front_dir, front_stream_index
         )
         self.extract_back_stream(
-            self.config.input_mp4, self.config.extracted_back_dir, self.config.back_stream_index
+            input_path, self.config.extracted_back_dir, back_stream_index
         )
         front_count, back_count = self.verify_frame_counts(
             self.config.extracted_front_dir, self.config.extracted_back_dir
         )
+        selection = self.stream_selection_from_probe(probe_payload)
         return PhaseResult(
             phase="extract_streams",
             status="ok",
-            message="Extracted front/back streams with matching frame counts.",
-            details={"front_count": front_count, "back_count": back_count},
+            message=self.build_selection_message(selection, front_count, back_count),
+            details={
+                "front_count": front_count,
+                "back_count": back_count,
+                "video_stream_count": selection["video_stream_count"],
+                "usable_video_stream_count": selection["usable_video_stream_count"],
+                "selected_front_stream_index": front_stream_index,
+                "selected_back_stream_index": back_stream_index,
+                "ignored_stream_indices": selection["ignored_stream_indices"],
+            },
         )
 
-    def _extract_stream(self, mp4_path: Path, out_dir: Path, stream_index: int, prefix: str) -> None:
+    @staticmethod
+    def stream_selection_from_probe(probe_payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """Return the validated stream-selection block from a probe payload."""
+
+        selection = probe_payload.get("stream_selection")
+        if not isinstance(selection, Mapping):
+            raise PipelineError("probe_streams() did not return stream_selection metadata.")
+        return dict(selection)
+
+    @classmethod
+    def selected_stream_index_from_probe(cls, probe_payload: Mapping[str, Any], side: str) -> int:
+        """Return the selected ffmpeg video-stream index for the requested side."""
+
+        selection = cls.stream_selection_from_probe(probe_payload)
+        stream_info = selection.get(side)
+        if not isinstance(stream_info, Mapping):
+            raise PipelineError("probe_streams() did not return '{0}' stream metadata.".format(side))
+        stream_index = stream_info.get("video_stream_index")
+        if not isinstance(stream_index, int):
+            raise PipelineError("Selected {0} stream is missing a valid video_stream_index.".format(side))
+        return stream_index
+
+    @staticmethod
+    def build_selection_message(selection: Mapping[str, Any], front_count: int, back_count: int) -> str:
+        """Build a concise extraction summary with selected and ignored streams."""
+
+        front_stream = selection.get("front", {})
+        back_stream = selection.get("back", {})
+        ignored_streams = list(selection.get("ignored_stream_indices", []))
+        return (
+            "Extracted front/back streams with matching frame counts. "
+            "Detected {0} video streams ({1} usable); selected front={2} back={3}; ignored={4}; "
+            "front_count={5}; back_count={6}."
+        ).format(
+            selection.get("video_stream_count", 0),
+            selection.get("usable_video_stream_count", 0),
+            front_stream.get("video_stream_index"),
+            back_stream.get("video_stream_index"),
+            ignored_streams,
+            front_count,
+            back_count,
+        )
+
+    def _extract_stream(self, input_path: Path, out_dir: Path, stream_index: int, prefix: str) -> None:
         """Run ffmpeg for a single stream."""
 
         out_dir.mkdir(parents=True, exist_ok=True)
         self._clear_directory(out_dir, "{0}_*.jpg".format(prefix))
 
         output_pattern = out_dir / "{0}_%06d.jpg".format(prefix)
-        command = ["ffmpeg", "-y", "-i", str(mp4_path), "-map", "0:v:{0}".format(stream_index)]
+        command = ["ffmpeg", "-y", "-i", str(input_path), "-map", "0:v:{0}".format(stream_index)]
         command.extend(self._build_frame_sampling_args())
 
         command.extend(["-q:v", str(self.config.jpeg_quality), str(output_pattern)])
@@ -1105,6 +1231,185 @@ class FFmpegExtractor:
             raise PipelineError(
                 "ffmpeg did not produce extracted frames for stream index {0}.".format(stream_index)
             )
+
+    @staticmethod
+    def _stream_flag(value: Any) -> bool:
+        """Convert ffprobe flag-like values into booleans."""
+
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text or text in ("0", "false", "no", "off", "none"):
+            return False
+        return True
+
+    def _build_video_stream_records(self, streams: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """Create detailed records for every ffprobe video stream."""
+
+        video_streams: List[Dict[str, Any]] = []
+        for video_stream_index, stream in enumerate(
+            stream for stream in streams if stream.get("codec_type") == "video"
+        ):
+            disposition = dict(stream.get("disposition") or {})
+            tags = dict(stream.get("tags") or {})
+            unusable_reasons: List[str] = []
+            if self._stream_flag(disposition.get("attached_pic")):
+                unusable_reasons.append("attached_pic")
+            if self._stream_flag(disposition.get("timed_thumbnails")):
+                unusable_reasons.append("timed_thumbnails")
+            video_streams.append(
+                {
+                    "video_stream_index": video_stream_index,
+                    "ffprobe_stream_index": stream.get("index"),
+                    "codec_name": stream.get("codec_name"),
+                    "width": stream.get("width"),
+                    "height": stream.get("height"),
+                    "disposition": disposition,
+                    "tags": tags,
+                    "is_usable": not unusable_reasons,
+                    "unusable_reasons": unusable_reasons,
+                }
+            )
+        return video_streams
+
+    @staticmethod
+    def _log_video_stream_details(video_streams: Sequence[Mapping[str, Any]]) -> None:
+        """Emit detailed logs for later triage of extra video streams."""
+
+        for stream in video_streams:
+            LOGGER.info(
+                "Video stream detected: v:%s ffprobe_index=%s codec=%s size=%sx%s usable=%s reasons=%s disposition=%s tags=%s",
+                stream.get("video_stream_index"),
+                stream.get("ffprobe_stream_index"),
+                stream.get("codec_name"),
+                stream.get("width"),
+                stream.get("height"),
+                stream.get("is_usable"),
+                list(stream.get("unusable_reasons", [])),
+                json.dumps(stream.get("disposition", {}), ensure_ascii=False, sort_keys=True),
+                json.dumps(stream.get("tags", {}), ensure_ascii=False, sort_keys=True),
+            )
+
+    def _select_stream_pair(
+        self,
+        video_streams: Sequence[Mapping[str, Any]],
+        usable_video_streams: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Validate configured front/back stream indices against the probed video streams."""
+
+        available_video_indices = [int(stream["video_stream_index"]) for stream in video_streams]
+        usable_video_indices = [int(stream["video_stream_index"]) for stream in usable_video_streams]
+        if len(usable_video_streams) < 2:
+            message = (
+                "Expected at least 2 usable video streams in the OSV container, but found {0} usable "
+                "streams out of {1} detected video streams."
+            ).format(len(usable_video_streams), len(video_streams))
+            LOGGER.error(
+                "%s detected=%s usable=%s",
+                message,
+                available_video_indices,
+                usable_video_indices,
+            )
+            raise PipelineError(message)
+
+        selected_streams: Dict[str, Dict[str, Any]] = {}
+        for side, stream_index in (
+            ("front", self.config.front_stream_index),
+            ("back", self.config.back_stream_index),
+        ):
+            stream_info = next(
+                (
+                    dict(candidate)
+                    for candidate in video_streams
+                    if int(candidate["video_stream_index"]) == int(stream_index)
+                ),
+                None,
+            )
+            if stream_info is None:
+                message = (
+                    "{0}_stream_index={1} did not match any detected video stream. "
+                    "detected={2}, usable={3}"
+                ).format(side, stream_index, available_video_indices, usable_video_indices)
+                LOGGER.error(message)
+                raise PipelineError(message)
+            if not stream_info.get("is_usable", False):
+                message = (
+                    "{0}_stream_index={1} points to a non-usable video stream. "
+                    "ffprobe_index={2}, reasons={3}"
+                ).format(
+                    side,
+                    stream_index,
+                    stream_info.get("ffprobe_stream_index"),
+                    list(stream_info.get("unusable_reasons", [])),
+                )
+                LOGGER.error(message)
+                raise PipelineError(message)
+            selected_streams[side] = stream_info
+
+        if selected_streams["front"]["video_stream_index"] == selected_streams["back"]["video_stream_index"]:
+            message = "front_stream_index and back_stream_index must select different video streams."
+            LOGGER.error(message)
+            raise PipelineError(message)
+
+        selected_indices = {
+            int(selected_streams["front"]["video_stream_index"]),
+            int(selected_streams["back"]["video_stream_index"]),
+        }
+        ignored_stream_indices = [
+            int(stream["video_stream_index"]) for stream in video_streams if int(stream["video_stream_index"]) not in selected_indices
+        ]
+        ignored_usable_stream_indices = [
+            int(stream["video_stream_index"])
+            for stream in usable_video_streams
+            if int(stream["video_stream_index"]) not in selected_indices
+        ]
+        ignored_non_usable_stream_indices = [
+            int(stream["video_stream_index"])
+            for stream in video_streams
+            if not stream.get("is_usable", False) and int(stream["video_stream_index"]) not in selected_indices
+        ]
+        return {
+            "video_stream_count": len(video_streams),
+            "usable_video_stream_count": len(usable_video_streams),
+            "front": selected_streams["front"],
+            "back": selected_streams["back"],
+            "ignored_stream_indices": ignored_stream_indices,
+            "ignored_usable_stream_indices": ignored_usable_stream_indices,
+            "ignored_non_usable_stream_indices": ignored_non_usable_stream_indices,
+        }
+
+    @staticmethod
+    def _log_stream_selection(selection: Mapping[str, Any]) -> None:
+        """Emit a compact summary for the selected and ignored streams."""
+
+        front_stream = selection.get("front", {})
+        back_stream = selection.get("back", {})
+        LOGGER.info(
+            "Detected %s video streams; selected front=%s back=%s; ignored=%s",
+            selection.get("video_stream_count", 0),
+            front_stream.get("video_stream_index"),
+            back_stream.get("video_stream_index"),
+            list(selection.get("ignored_stream_indices", [])),
+        )
+        LOGGER.info(
+            "Selected stream details: front(v:%s ffprobe_index=%s codec=%s size=%sx%s) "
+            "back(v:%s ffprobe_index=%s codec=%s size=%sx%s) usable=%s",
+            front_stream.get("video_stream_index"),
+            front_stream.get("ffprobe_stream_index"),
+            front_stream.get("codec_name"),
+            front_stream.get("width"),
+            front_stream.get("height"),
+            back_stream.get("video_stream_index"),
+            back_stream.get("ffprobe_stream_index"),
+            back_stream.get("codec_name"),
+            back_stream.get("width"),
+            back_stream.get("height"),
+            selection.get("usable_video_stream_count", 0),
+        )
 
     def _build_frame_sampling_args(self) -> List[str]:
         """Build ffmpeg arguments for frame sampling.
@@ -2638,17 +2943,21 @@ class PipelineController:
         return summary
 
     def _run_extract_streams_impl(self) -> PhaseResult:
+        input_path = self.config.require_input_video()
         self._set_step("extract_streams", "probe_streams", 1, 5)
-        payload = self.extractor.probe_streams(self.config.input_mp4)
+        payload = self.extractor.probe_streams(input_path)
+        selection = self.extractor.stream_selection_from_probe(payload)
+        front_stream_index = self.extractor.selected_stream_index_from_probe(payload, "front")
+        back_stream_index = self.extractor.selected_stream_index_from_probe(payload, "back")
 
         self._set_step("extract_streams", "extract_front_stream", 2, 5)
         self.extractor.extract_front_stream(
-            self.config.input_mp4, self.config.extracted_front_dir, self.config.front_stream_index
+            input_path, self.config.extracted_front_dir, front_stream_index
         )
 
         self._set_step("extract_streams", "extract_back_stream", 3, 5)
         self.extractor.extract_back_stream(
-            self.config.input_mp4, self.config.extracted_back_dir, self.config.back_stream_index
+            input_path, self.config.extracted_back_dir, back_stream_index
         )
 
         self._set_step("extract_streams", "verify_frame_counts", 4, 5)
@@ -2657,12 +2966,19 @@ class PipelineController:
         )
 
         self._set_step("extract_streams", "complete", 5, 5)
-        streams = [stream for stream in payload.get("streams", []) if stream.get("codec_type") == "video"]
         return PhaseResult(
             phase="extract_streams",
             status="ok",
-            message="Extracted front/back streams with matching frame counts.",
-            details={"front_count": front_count, "back_count": back_count, "video_stream_count": len(streams)},
+            message=self.extractor.build_selection_message(selection, front_count, back_count),
+            details={
+                "front_count": front_count,
+                "back_count": back_count,
+                "video_stream_count": selection["video_stream_count"],
+                "usable_video_stream_count": selection["usable_video_stream_count"],
+                "selected_front_stream_index": front_stream_index,
+                "selected_back_stream_index": back_stream_index,
+                "ignored_stream_indices": selection["ignored_stream_indices"],
+            },
         )
 
     def _run_select_frames_impl(self) -> PhaseResult:
@@ -2967,7 +3283,9 @@ if QtWidgets is not None:
             LOGGER.addHandler(self._gui_log_handler)
             self._build_ui()
             self._populate_widgets_from_config(self.config)
-            self._load_last_used_config_if_available()
+            loaded_previous = self._load_last_used_config_if_available()
+            if not loaded_previous:
+                self._refresh_input_osv_field_state()
             self.refresh_summary()
 
         def closeEvent(self, event: Any) -> None:
@@ -3024,7 +3342,16 @@ if QtWidgets is not None:
             layout = QtWidgets.QVBoxLayout(tab)
             form = QtWidgets.QFormLayout()
 
-            form.addRow("Input MP4", self._build_path_field("input_mp4", directory=False))
+            form.addRow(
+                "Input OSV",
+                self._build_path_field(
+                    "input_mp4",
+                    directory=False,
+                    dialog_title="Select OSV",
+                    file_filter="OSV Files (*.osv);;All Files (*)",
+                    placeholder=_INPUT_OSV_PLACEHOLDER,
+                ),
+            )
             form.addRow("Work Folder", self._build_path_field("work_root", directory=True))
             form.addRow("Front Stream Index", self._register_widget("front_stream_index", self._spin_box(0, 99)))
             form.addRow("Back Stream Index", self._register_widget("back_stream_index", self._spin_box(0, 99)))
@@ -3222,13 +3549,25 @@ if QtWidgets is not None:
             layout.addWidget(self.log_view, 2)
             return tab
 
-        def _build_path_field(self, name: str, directory: bool) -> Any:
+        def _build_path_field(
+            self,
+            name: str,
+            directory: bool,
+            dialog_title: Optional[str] = None,
+            file_filter: str = "All Files (*)",
+            placeholder: str = "",
+        ) -> Any:
             container = QtWidgets.QWidget()
             row = QtWidgets.QHBoxLayout(container)
             row.setContentsMargins(0, 0, 0, 0)
             line_edit = QtWidgets.QLineEdit()
+            if placeholder:
+                line_edit.setPlaceholderText(placeholder)
+            line_edit.editingFinished.connect(
+                lambda name=name, widget=line_edit: self._sync_path_field_value(name, widget.text())
+            )
             browse_button = QtWidgets.QPushButton("Browse")
-            browse_button.clicked.connect(lambda: self._browse_path(name, directory))
+            browse_button.clicked.connect(lambda: self._browse_path(name, directory, dialog_title, file_filter))
             row.addWidget(line_edit, 1)
             row.addWidget(browse_button)
             self._widgets[name] = line_edit
@@ -3273,20 +3612,40 @@ if QtWidgets is not None:
             widget.setSingleStep(single_step)
             return widget
 
-        def _browse_path(self, name: str, directory: bool) -> None:
+        def _browse_path(
+            self,
+            name: str,
+            directory: bool,
+            dialog_title: Optional[str] = None,
+            file_filter: str = "All Files (*)",
+        ) -> None:
             current_path = self._widgets[name].text().strip()
-            start_dir = current_path or str(self.config.project_root)
-            if directory:
-                selected_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", start_dir)
+            resolved_current = normalize_input_video_path(current_path) if current_path else None
+            if resolved_current is not None and not directory and resolved_current.suffix:
+                start_dir = str(resolved_current.parent)
+            elif resolved_current is not None:
+                start_dir = str(resolved_current)
             else:
-                selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select File", start_dir)
+                start_dir = str(self.config.project_root)
+            if directory:
+                selected_path = QtWidgets.QFileDialog.getExistingDirectory(
+                    self,
+                    dialog_title or "Select Directory",
+                    start_dir,
+                )
+            else:
+                selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    dialog_title or "Select File",
+                    start_dir,
+                    file_filter,
+                )
             if selected_path:
                 self._widgets[name].setText(selected_path)
-                if name == "work_root":
-                    self._set_status("info", "Work root changed. Save or run to persist the new config path.")
+                self._sync_path_field_value(name, selected_path, announce=True)
 
         def _populate_widgets_from_config(self, config: PipelineConfig) -> None:
-            self._widgets["input_mp4"].setText(str(config.input_mp4))
+            self._widgets["input_mp4"].setText(_path_text(config.input_mp4))
             self._widgets["work_root"].setText(str(config.work_root))
             self._widgets["mask_model_path"].setText(str(config.mask_model_path))
             self._widgets["front_stream_index"].setValue(config.front_stream_index)
@@ -3321,6 +3680,21 @@ if QtWidgets is not None:
             self._widgets["rig_relative_rotation"].setText(
                 ", ".join(str(value) for value in config.rig_relative_rotation)
             )
+            self._refresh_input_osv_field_state()
+
+        def _sync_path_field_value(self, name: str, value: str, announce: bool = False) -> None:
+            updated = PipelineConfig.from_mapping(self.config.to_dict())
+            updated.update_from_mapping({name: value})
+            self.config = updated
+            self.pipeline = self._build_pipeline(self.config)
+            if name == "input_mp4":
+                self._refresh_input_osv_field_state(
+                    status_prefix="Updated Input OSV selection." if announce else None
+                )
+            elif name == "work_root" and announce:
+                self._set_status("info", "Work root changed. Save or run to persist the new config path.")
+            if name in ("input_mp4", "work_root"):
+                self.refresh_summary()
 
         def _sync_config_from_widgets(self) -> None:
             config = PipelineConfig.from_mapping(self.config.to_dict())
@@ -3361,6 +3735,26 @@ if QtWidgets is not None:
             )
             self.config = config
             self.pipeline = self._build_pipeline(self.config)
+            self._refresh_input_osv_field_state()
+
+        def _refresh_input_osv_field_state(self, status_prefix: Optional[str] = None) -> None:
+            input_widget = self._widgets.get("input_mp4")
+            if input_widget is None:
+                return
+            issue = self.config.input_video_validation_error(require_exists=True)
+            if issue is None:
+                input_widget.setStyleSheet("")
+                input_widget.setToolTip("OSV container is ready for ffprobe / ffmpeg.")
+                if status_prefix:
+                    self._set_status("ok", status_prefix)
+                return
+
+            input_widget.setStyleSheet("border: 1px solid #c98900; background: #fff8e1;")
+            input_widget.setToolTip(str(issue))
+            if status_prefix:
+                self._set_status("warning", "{0} {1}".format(status_prefix, issue))
+            elif not input_widget.text().strip():
+                self._set_status("warning", str(issue))
 
         def _save_last_used_config(self, silent: bool = False) -> None:
             try:
@@ -3372,7 +3766,7 @@ if QtWidgets is not None:
                 if not silent:
                     self._set_status("error", "Failed to save config: {0}".format(exc))
 
-        def _load_last_used_config_if_available(self) -> None:
+        def _load_last_used_config_if_available(self) -> bool:
             candidate_paths: List[Path] = []
             for path in (
                 _default_last_used_config_path(self.config.project_root),
@@ -3392,8 +3786,14 @@ if QtWidgets is not None:
                 self.config = loaded
                 self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
-                self._set_status("ok", "Loaded previous config from {0}".format(candidate_path))
-                return
+                issue = self.config.input_video_validation_error(require_exists=True)
+                status = "ok" if issue is None else "warning"
+                message = "Loaded previous config from {0}".format(candidate_path)
+                if issue is not None:
+                    message = "{0}. {1}".format(message, issue)
+                self._set_status(status, message)
+                return True
+            return False
 
         def save_config(self) -> None:
             self._save_last_used_config(silent=False)
@@ -3414,7 +3814,12 @@ if QtWidgets is not None:
                 self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
                 self.refresh_summary()
-                self._set_status("ok", "Loaded config from {0}".format(selected_path))
+                issue = self.config.input_video_validation_error(require_exists=True)
+                status = "ok" if issue is None else "warning"
+                message = "Loaded config from {0}".format(selected_path)
+                if issue is not None:
+                    message = "{0}. {1}".format(message, issue)
+                self._set_status(status, message)
             except Exception as exc:
                 self._set_status("error", "Failed to load config: {0}".format(exc))
 
@@ -3423,7 +3828,7 @@ if QtWidgets is not None:
             self.pipeline = self._build_pipeline(self.config)
             self._populate_widgets_from_config(self.config)
             self.refresh_summary()
-            self._set_status("info", "Reset GUI fields to default config values.")
+            self._refresh_input_osv_field_state("Reset GUI fields to default config values.")
 
         def _run_action(self, action_name: str, runner: Callable[[], PhaseResult]) -> None:
             self._set_running(True)

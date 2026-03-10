@@ -290,6 +290,7 @@
 ### 5.1 絶対に守る仕様
 - [ ] 片方だけ保存する仕様にしていない
 - [ ] 「片方でもOKなら両方残す」を守っている
+- [ ] 入力は `.osv` コンテナ前提になっている
 - [ ] Metashape 読込は MultiplaneLayout
 - [ ] sensor は Fisheye
 - [ ] 前処理で削りすぎていない
@@ -297,6 +298,13 @@
 
 ### 5.2 ログ
 - [ ] `ffprobe.json`
+- [ ] `ffprobe.json` records selected front/back stream indices
+- [ ] `ffprobe.json` records ignored stream indices or equivalent stream-selection metadata
+- [ ] `.osv` with 3 or more video streams does not fail when valid front/back indices are configured
+- [ ] selected `front_stream_index` / `back_stream_index` are visible in the log output
+- [ ] ignored video streams can be traced from the log output
+- [ ] GUI shows a clear warning or error when probe results do not match the configured stream indices
+- [ ] GUI can continue on `.osv` inputs with 3 or more video streams when the selected front/back indices are valid
 - [ ] `frame_quality.csv`
 - [ ] `mask_summary.csv`
 - [ ] `metashape_quality.csv`
@@ -310,6 +318,11 @@
 - [ ] quality 値取得確認
 - [ ] アライメント成功確認
 - [ ] 冗長除外後の再アライメント確認
+
+### 5.4 GUI / Config 検証
+- [ ] GUI で選択した `.osv` が `PipelineConfig.input_mp4` に反映される
+- [ ] `validate(require_input=True)` が未選択 / ディレクトリ / `.osv` 以外 / 不存在を区別できる
+- [ ] stale `last_used_config.json` に `.mp4` が残っていても GUI 起動が継続し、再選択した `.osv` が優先される
 
 ---
 
