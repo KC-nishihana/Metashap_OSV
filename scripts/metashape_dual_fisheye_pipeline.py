@@ -43,6 +43,11 @@ try:
 except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
     YOLO = None  # type: ignore
 
+try:
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - depends on the Metashape runtime environment.
+    torch = None  # type: ignore
+
 QT_BINDING = ""
 QtCore = None  # type: ignore
 QtGui = None  # type: ignore
@@ -75,7 +80,7 @@ _MENU_REGISTERED = False
 _GUI_DIALOG = None
 _PIPELINE_SCRIPT_NAME = "metashape_dual_fisheye_pipeline.py"
 _INPUT_OSV_SUFFIX = ".osv"
-_INPUT_OSV_PLACEHOLDER = "No OSV selected"
+_INPUT_OSV_PLACEHOLDER = "OSV未選択"
 
 
 def _default_project_root() -> Path:
@@ -339,6 +344,10 @@ class PipelineConfig:
     cuda_log_device_info: bool = True
     cuda_use_gaussian_preblur: bool = False
     cuda_benchmark_mode: bool = False
+    yolo_device_mode: str = "auto"
+    prefer_yolo_cuda: bool = True
+    yolo_allow_fallback: bool = True
+    yolo_device_index: int = 0
     save_backend_report: bool = True
 
     @property
@@ -394,6 +403,18 @@ class PipelineConfig:
         return self.log_dir / "cuda_fallback.log"
 
     @property
+    def yolo_backend_report_path(self) -> Path:
+        return self.log_dir / "yolo_backend_report.json"
+
+    @property
+    def metashape_gpu_report_path(self) -> Path:
+        return self.log_dir / "metashape_gpu_report.json"
+
+    @property
+    def gpu_summary_report_path(self) -> Path:
+        return self.log_dir / "gpu_summary_report.json"
+
+    @property
     def mask_summary_log_path(self) -> Path:
         return self.log_dir / "mask_summary.csv"
 
@@ -436,6 +457,10 @@ class PipelineConfig:
             raise ValueError("opencv_backend must be one of: auto, cpu, cuda.")
         if self.cuda_device_index < 0:
             raise ValueError("cuda_device_index must be >= 0.")
+        if self.yolo_device_mode not in ("auto", "cpu", "cuda"):
+            raise ValueError("yolo_device_mode must be one of: auto, cpu, cuda.")
+        if self.yolo_device_index < 0:
+            raise ValueError("yolo_device_index must be >= 0.")
         if self.keep_rule != "either_side_ok_keep_both":
             raise ValueError("keep_rule must remain 'either_side_ok_keep_both'.")
         if self.mask_model != "yolo":
@@ -495,6 +520,77 @@ class PipelineConfig:
             self.project_path.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+    def mask_model_path_text(self) -> str:
+        """Return the raw model-path text as stored in config / GUI state."""
+
+        return str(self.mask_model_path).strip()
+
+    def mask_model_candidate_paths(self) -> List[Path]:
+        """Build the local YOLO model lookup order without assuming network download."""
+
+        raw_value = self.mask_model_path_text()
+        if not raw_value:
+            return []
+
+        configured_path = Path(raw_value).expanduser()
+        candidates: List[Path] = []
+        if configured_path.is_absolute():
+            candidates.append(configured_path)
+        else:
+            candidates.append((self.project_root / configured_path).expanduser())
+            candidates.append((self.work_root / configured_path).expanduser())
+
+        unique_candidates: List[Path] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            try:
+                normalized_candidate = candidate.resolve(strict=False)
+            except Exception:
+                normalized_candidate = candidate
+            key = str(normalized_candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(normalized_candidate)
+        return unique_candidates
+
+    def find_local_mask_model_path(self) -> Optional[Path]:
+        """Return the first existing local model path according to the configured lookup order."""
+
+        for candidate in self.mask_model_candidate_paths():
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def mask_model_validation_error(self) -> Optional[Exception]:
+        """Return a GUI-friendly model-path validation error without triggering downloads."""
+
+        raw_value = self.mask_model_path_text()
+        if not raw_value:
+            return ValueError("YOLO model file is not configured. Please select a local .pt file in GUI.")
+        if self.find_local_mask_model_path() is not None:
+            return None
+        return FileNotFoundError(
+            "YOLO model file is not available locally. Model file not found locally: {0}. "
+            "Please select a local .pt file in GUI.".format(raw_value)
+        )
+
+    def resolve_mask_model_path(self) -> Path:
+        """Resolve the configured YOLO model to a verified local file path."""
+
+        resolved_path = self.find_local_mask_model_path()
+        if resolved_path is not None:
+            return resolved_path
+
+        raw_value = self.mask_model_path_text() or "<empty>"
+        candidate_paths = [str(path) for path in self.mask_model_candidate_paths()]
+        LOGGER.error("Model file not found locally: %s", raw_value)
+        LOGGER.error("Checked YOLO model candidates: %s", candidate_paths)
+        raise PipelineError(
+            "YOLO model file is not available locally. Model file not found locally: {0}. "
+            "Please select a local .pt file in GUI.".format(raw_value)
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize config for logs."""
@@ -577,6 +673,8 @@ class CudaCapabilityReport:
     set_device_available: bool = False
     get_device_available: bool = False
     device_info_logged: bool = False
+    device_names: List[str] = field(default_factory=list)
+    selected_device_name: str = ""
     fallback_reasons: List[str] = field(default_factory=list)
     fallback_events: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -584,6 +682,379 @@ class CudaCapabilityReport:
 
     def to_dict(self) -> Dict[str, Any]:
         return {key: _as_serializable(value) for key, value in asdict(self).items()}
+
+
+@dataclass
+class YoloBackendReport:
+    """Normalized runtime view of YOLO / PyTorch device selection and fallback state."""
+
+    ultralytics_available: bool = False
+    torch_available: bool = False
+    torch_version: str = ""
+    cuda_available: bool = False
+    cuda_device_count: int = 0
+    requested_mode: str = "auto"
+    selected_device: str = "cpu"
+    active_device: str = "cpu"
+    prefer_cuda: bool = True
+    allow_fallback: bool = True
+    device_index: int = 0
+    device_name: str = ""
+    device_names: List[str] = field(default_factory=list)
+    model_loaded: bool = False
+    local_model_path: str = ""
+    fallback_reasons: List[str] = field(default_factory=list)
+    fallback_events: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {key: _as_serializable(value) for key, value in asdict(self).items()}
+
+
+@dataclass
+class MetashapeGpuReport:
+    """Best-effort runtime view of Metashape GPU availability without enforcing control APIs."""
+
+    metashape_available: bool = False
+    app_available: bool = False
+    status: str = "unverified"
+    gpu_mask: Optional[int] = None
+    cpu_enable: Optional[bool] = None
+    gpu_devices: List[Dict[str, Any]] = field(default_factory=list)
+    gpu_device_count: int = 0
+    warnings: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    todo: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {key: _as_serializable(value) for key, value in asdict(self).items()}
+
+
+class JapaneseUiText:
+    """Centralized Japanese labels and status text for the GUI-facing layer."""
+
+    MENU_SUFFIXES = {
+        "00 Open GUI": "00 GUIを開く",
+        "01 Run Full Pipeline": "01 フルパイプライン実行",
+        "02 Extract Streams": "02 ストリーム抽出",
+        "03 Select Frames": "03 フレーム選別",
+        "04 Generate Masks": "04 マスク生成",
+        "05 Import to Metashape": "05 Metashapeへ読込",
+        "06 Align": "06 アライメント",
+        "07 Reduce Overlap": "07 冗長画像削減",
+        "08 Export Logs": "08 ログ出力",
+    }
+    ACTION_LABELS = {
+        "run_full_pipeline": "フル実行",
+        "extract_streams": "ストリーム抽出",
+        "select_frames": "フレーム選別",
+        "generate_masks": "マスク生成",
+        "import_to_metashape": "Metashapeへ読込",
+        "align": "アライメント",
+        "reduce_overlap": "冗長画像削減",
+        "export_logs": "ログ出力",
+    }
+    PHASE_LABELS = {
+        "run_full_pipeline": "フルパイプライン",
+        "extract_streams": "ストリーム抽出",
+        "select_frames": "フレーム選別",
+        "generate_masks": "マスク生成",
+        "import_to_metashape": "Metashape読込",
+        "align": "アライメント",
+        "reduce_overlap": "冗長画像削減",
+        "export_logs": "ログ出力",
+    }
+    STEP_LABELS = {
+        "probe_streams": "ストリーム確認",
+        "extract_front_stream": "前方ストリーム抽出",
+        "extract_back_stream": "後方ストリーム抽出",
+        "verify_frame_counts": "抽出枚数確認",
+        "complete": "完了",
+        "select_pairs": "フレームペア評価",
+        "process_directory_front_back": "前後画像を処理",
+        "create_or_get_chunk": "chunk準備",
+        "build_filename_sequence": "読込順序作成",
+        "build_filegroups": "filegroups作成",
+        "import_multiplane_images": "MultiplaneLayout読込",
+        "set_sensor_types": "魚眼センサー設定",
+        "apply_rig_reference": "rig参照設定",
+        "apply_masks_from_disk": "マスク適用",
+        "save_document": "ドキュメント保存",
+        "analyze_image_quality": "画質評価",
+        "disable_low_quality_cameras": "低品質画像を無効化",
+        "export_quality_log_before_align": "画質ログ出力",
+        "match_photos": "matchPhotos実行",
+        "align_cameras": "alignCameras実行",
+        "export_quality_log_and_save": "画質ログ出力と保存",
+        "disable_redundant_cameras": "冗長画像を無効化",
+        "realign_after_cleanup": "再アライメント",
+        "run_reduce_overlap_builtin": "内蔵reduceOverlap実行",
+        "export_overlap_log_and_save": "間引きログ出力と保存",
+        "write_summary": "サマリー出力",
+    }
+    DIRECT_TRANSLATIONS = {
+        "Ready": "準備完了",
+        "Idle": "待機中",
+        "Running...": "実行中...",
+        "Input OSV is not selected.": "入力OSVが未選択です。",
+        "Input file must be a .osv file.": "入力ファイルは .osv である必要があります。",
+        "YOLO model file is not configured. Please select a local .pt file in GUI.": (
+            "YOLOモデルファイルが未設定です。GUIでローカルの .pt ファイルを選択してください。"
+        ),
+        "CUDA is not available for YOLO inference.": "YOLO 推論で CUDA を利用できません。",
+        "CUDA is not available for YOLO inference. Fallback to CPU.": (
+            "YOLO 推論で CUDA が利用できないため、CPU に切り替えました。"
+        ),
+        "No active chunk is available.": "アクティブなchunkがありません。",
+        "Active chunk has no cameras to align.": "アクティブなchunkにアライメント対象カメラがありません。",
+        "Selected paired frames using the either-side-OK keep-both rule.": (
+            "片側合格なら両側採用の keep rule でフレームペアを選別しました。"
+        ),
+        "Generated binary mask PNGs for selected front/back frame pairs.": (
+            "選別済み front/back フレームペアのバイナリマスク PNG を生成しました。"
+        ),
+        "Imported selected front/back pairs using MultiplaneLayout and applied per-camera masks.": (
+            "選別済み front/back ペアを MultiplaneLayout で読み込み、カメラ単位マスクを適用しました。"
+        ),
+        "Ran image quality analysis, disabled low-quality cameras, and aligned the active chunk.": (
+            "画質評価、低品質カメラの無効化、アクティブchunkのアライメントを実行しました。"
+        ),
+        "Reduced redundant aligned stations using distance and rotation thresholds.": (
+            "距離閾値と回転閾値に基づいて冗長なアライメント済みステーションを削減しました。"
+        ),
+        "Exported the current pipeline log summary.": "現在のパイプラインログ要約を出力しました。",
+        "Phase 1 through Phase 3 completed through alignment, overlap reduction, and log export.": (
+            "Phase 1 から Phase 3 までを実行し、アライメント、冗長画像削減、ログ出力まで完了しました。"
+        ),
+        "FFT blur threshold must be blank or numeric.": "FFTブレ閾値は空欄または数値で入力してください。",
+        "Rig vectors must contain exactly 3 comma-separated numbers.": (
+            "rigベクトルはカンマ区切りの3要素で入力してください。"
+        ),
+        "Rig vectors must contain numeric values.": "rigベクトルには数値を入力してください。",
+        "Qt bindings are not available in this Python runtime. Use the existing menu actions and validate the current Metashape Qt binding.": (
+            "この Python 実行環境では Qt バインディングが利用できません。既存メニューを使用し、現在の Metashape Qt バインディングを確認してください。"
+        ),
+    }
+    PREFIX_TRANSLATIONS = (
+        ("Input OSV not found: ", "入力OSVが見つかりません: "),
+        ("Input OSV must be a file, not a directory: ", "入力OSVはディレクトリではなくファイルを指定してください: "),
+        (
+            "YOLO model file is not available locally. Model file not found locally: ",
+            "YOLOモデルファイルがローカルに見つかりません: ",
+        ),
+        ("Saved config to ", "設定を保存しました: "),
+        ("Failed to save config: ", "設定の保存に失敗しました: "),
+        ("Loaded previous config from ", "前回の設定を読み込みました: "),
+        ("Loaded config from ", "設定を読み込みました: "),
+        ("Failed to load config: ", "設定の読込に失敗しました: "),
+        ("Updated Input OSV selection.", "入力OSVを更新しました。"),
+        ("Updated YOLO model path.", "YOLOモデルパスを更新しました。"),
+        (
+            "Work root changed. Save or run to persist the new config path.",
+            "作業フォルダを変更しました。保存または実行すると新しい設定パスが反映されます。",
+        ),
+        ("Reset GUI fields to default config values.", "GUIの設定値を初期値に戻しました。"),
+        ("Failed to read backend report: ", "backend report の読込に失敗しました: "),
+    )
+
+    @classmethod
+    def translate(cls, text: str) -> str:
+        translated = cls.DIRECT_TRANSLATIONS.get(text, text)
+        model_prefix = "YOLO model file is not available locally. Model file not found locally: "
+        model_suffix = ". Please select a local .pt file in GUI."
+        if translated.startswith(model_prefix):
+            model_path = translated[len(model_prefix) :]
+            if model_path.endswith(model_suffix):
+                model_path = model_path[: -len(model_suffix)]
+            return "YOLOモデルファイルがローカルに見つかりません: {0}。GUIでローカルの .pt ファイルを選択してください。".format(
+                model_path
+            )
+        for prefix, replacement in cls.PREFIX_TRANSLATIONS:
+            if translated.startswith(prefix):
+                return replacement + translated[len(prefix) :]
+        if translated.endswith("...") and translated.startswith("Running "):
+            action_name = translated[len("Running ") : -3]
+            return "{0}を実行中...".format(cls.action_label(action_name))
+        return translated
+
+    @classmethod
+    def action_label(cls, action_name: str) -> str:
+        return cls.ACTION_LABELS.get(action_name, action_name)
+
+    @classmethod
+    def phase_label(cls, phase_name: str) -> str:
+        return cls.PHASE_LABELS.get(phase_name, phase_name)
+
+    @classmethod
+    def step_label(cls, step_name: str) -> str:
+        return cls.STEP_LABELS.get(step_name, step_name)
+
+    @classmethod
+    def progress_label(cls, phase_name: str, step_name: str) -> str:
+        return "{0}: {1}".format(cls.phase_label(phase_name), cls.step_label(step_name))
+
+    @classmethod
+    def menu_suffix(cls, suffix: str) -> str:
+        return cls.MENU_SUFFIXES.get(suffix, suffix)
+
+    @staticmethod
+    def opencv_status(report: Mapping[str, Any]) -> str:
+        active_backend = str(report.get("active_backend", "cpu"))
+        if active_backend == "cuda":
+            return "OpenCV: CUDA 使用中"
+        if report.get("fallback_events"):
+            return "OpenCV: CPU フォールバック"
+        return "OpenCV: CPU 実行"
+
+    @staticmethod
+    def yolo_status(report: Mapping[str, Any]) -> str:
+        active_device = str(report.get("active_device", "cpu"))
+        if active_device.startswith("cuda"):
+            return "YOLO: GPU 使用中"
+        if report.get("fallback_events"):
+            return "YOLO: CPU フォールバック"
+        return "YOLO: CPU 実行"
+
+    @staticmethod
+    def metashape_status(report: Mapping[str, Any]) -> str:
+        status = str(report.get("status", "unverified"))
+        device_count = int(report.get("gpu_device_count", 0) or 0)
+        if status == "detected" and device_count > 0:
+            return "Metashape GPU: 情報取得済み"
+        if status == "partial":
+            return "Metashape GPU: 一部取得"
+        return "Metashape GPU: 未確認"
+
+
+class GpuStatusAggregator:
+    """Aggregate OpenCV, YOLO, and Metashape GPU reports for logs and the GUI."""
+
+    def __init__(self, config: PipelineConfig, logs: LogWriter) -> None:
+        self.config = config
+        self.logs = logs
+
+    def collect_all(
+        self,
+        opencv_manager: "OpenCVBackendManager",
+        mask_generator: "MaskGenerator",
+        save: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        should_save = self.config.save_backend_report if save is None else save
+        opencv_report = dict(opencv_manager.build_backend_report())
+        yolo_report = dict(mask_generator.build_backend_report())
+        metashape_report = self.collect_metashape_report()
+        summary_report = self.build_summary(opencv_report, yolo_report, metashape_report)
+        if should_save:
+            self.logs.write_json(self.config.opencv_backend_report_path, opencv_report)
+            self.logs.write_json(self.config.yolo_backend_report_path, yolo_report)
+            self.logs.write_json(self.config.metashape_gpu_report_path, metashape_report)
+            self.logs.write_json(self.config.gpu_summary_report_path, summary_report)
+        return {
+            "opencv": opencv_report,
+            "yolo": yolo_report,
+            "metashape": metashape_report,
+            "summary": summary_report,
+        }
+
+    def build_summary(
+        self,
+        opencv_report: Mapping[str, Any],
+        yolo_report: Mapping[str, Any],
+        metashape_report: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        fallback_detected = bool(opencv_report.get("fallback_events")) or bool(yolo_report.get("fallback_events"))
+        device_indices: List[str] = []
+        opencv_index = opencv_report.get("active_device_index")
+        yolo_device = str(yolo_report.get("active_device", "cpu"))
+        if opencv_index is not None:
+            device_indices.append("OpenCV={0}".format(opencv_index))
+        if yolo_device.startswith("cuda:"):
+            device_indices.append("YOLO={0}".format(yolo_device.split(":", 1)[1]))
+        elif yolo_device.startswith("cuda"):
+            device_indices.append("YOLO=0")
+        return {
+            "opencv_status": JapaneseUiText.opencv_status(opencv_report),
+            "yolo_status": JapaneseUiText.yolo_status(yolo_report),
+            "metashape_gpu_status": JapaneseUiText.metashape_status(metashape_report),
+            "gpu_fallback": "あり" if fallback_detected else "なし",
+            "device_indices": ", ".join(device_indices) if device_indices else "-",
+            "backend_report_paths": {
+                "opencv": str(self.config.opencv_backend_report_path),
+                "yolo": str(self.config.yolo_backend_report_path),
+                "metashape": str(self.config.metashape_gpu_report_path),
+                "summary": str(self.config.gpu_summary_report_path),
+            },
+        }
+
+    def collect_metashape_report(self) -> Dict[str, Any]:
+        report = MetashapeGpuReport(
+            metashape_available=Metashape is not None,
+            app_available=bool(getattr(Metashape, "app", None)) if Metashape is not None else False,
+        )
+        if Metashape is None:
+            report.warnings.append("Metashape runtime is not available in this Python environment.")
+            return report.to_dict()
+        app = getattr(Metashape, "app", None)
+        if app is None:
+            report.warnings.append("Metashape.app is not available in this runtime.")
+            return report.to_dict()
+
+        known_fields = False
+        if hasattr(app, "gpu_mask"):
+            known_fields = True
+            try:
+                report.gpu_mask = int(getattr(app, "gpu_mask"))
+                report.notes.append("Read Metashape.app.gpu_mask from the current runtime.")
+            except Exception as exc:
+                report.warnings.append("Failed to read Metashape.app.gpu_mask: {0}".format(exc))
+        if hasattr(app, "cpu_enable"):
+            known_fields = True
+            try:
+                report.cpu_enable = bool(getattr(app, "cpu_enable"))
+                report.notes.append("Read Metashape.app.cpu_enable from the current runtime.")
+            except Exception as exc:
+                report.warnings.append("Failed to read Metashape.app.cpu_enable: {0}".format(exc))
+        if hasattr(app, "enumGPUDevices"):
+            known_fields = True
+            try:
+                devices = app.enumGPUDevices()
+                report.gpu_devices = self._serialize_metashape_devices(devices)
+                report.gpu_device_count = len(report.gpu_devices)
+                report.status = "detected"
+            except Exception as exc:
+                report.warnings.append("Failed to call Metashape.app.enumGPUDevices(): {0}".format(exc))
+        if not known_fields:
+            report.status = "unverified"
+            report.todo.append(
+                "TODO: validate the current Metashape GPU inspection API on this build before using it for control decisions."
+            )
+            return report.to_dict()
+        if report.status != "detected":
+            report.status = "partial"
+        # TODO: validate the semantics of gpu_mask / cpu_enable on the current Metashape build before writing settings.
+        report.todo.append(
+            "TODO: validate the semantics of Metashape.app.gpu_mask and Metashape.app.cpu_enable on the current build."
+        )
+        return report.to_dict()
+
+    @staticmethod
+    def _serialize_metashape_devices(devices: Any) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        if devices is None:
+            return serialized
+        for index, device in enumerate(list(devices)):
+            payload: Dict[str, Any] = {"index": index, "repr": str(device)}
+            for attr in ("name", "vendor", "memory", "total_memory", "driver"):
+                if not hasattr(device, attr):
+                    continue
+                value = getattr(device, attr)
+                try:
+                    payload[attr] = value() if callable(value) else value
+                except Exception:
+                    continue
+            serialized.append(payload)
+        return serialized
 
 
 class OpenCVBackendManager:
@@ -640,6 +1111,15 @@ class OpenCVBackendManager:
         except Exception as exc:
             report.warnings.append("Failed to query CUDA device count: {0}".format(exc))
             report.cuda_device_count = 0
+        if report.cuda_device_count > 0 and hasattr(cuda_api, "DeviceInfo"):
+            for device_index in range(report.cuda_device_count):
+                try:
+                    device_info = cuda_api.DeviceInfo(device_index)
+                except Exception:
+                    continue
+                device_name = self._device_name_from_info(device_info)
+                if device_name:
+                    report.device_names.append(device_name)
 
         report.cuda_api_available = report.cuda_device_count > 0 and report.laplacian_filter_available
         if report.cuda_device_count <= 0:
@@ -721,6 +1201,8 @@ class OpenCVBackendManager:
             raise PipelineError("Failed to activate CUDA device {0}: {1}".format(device_index, exc)) from exc
         self.active_device_index = device_index
         self._report.active_device_index = device_index
+        if len(self._report.device_names) > device_index:
+            self._report.selected_device_name = self._report.device_names[device_index]
         if self.config.cuda_log_device_info:
             self._log_device_info(device_index)
 
@@ -776,7 +1258,12 @@ class OpenCVBackendManager:
         LOGGER.warning("OpenCV backend fallback [%s]: %s", context, clean_reason)
         self.logs.append_line(
             self.config.cuda_fallback_log_path,
-            "{0}\t{1}\t{2}".format(context, event["requested_backend"], clean_reason),
+            "{0}\t{1}\t{2}\t{3}".format(
+                context,
+                event["requested_backend"],
+                event["image_path"] or "<unknown>",
+                clean_reason,
+            ),
         )
 
     def fallback_to_cpu(self, reason: str, context: str, image_path: Optional[Path] = None) -> None:
@@ -834,6 +1321,8 @@ class OpenCVBackendManager:
                 except Exception:
                     continue
             LOGGER.info("OpenCV CUDA device info: %s", details)
+            if not self._report.selected_device_name:
+                self._report.selected_device_name = str(details.get("name", ""))
             self._report.notes.append("Logged CUDA device info for device {0}.".format(device_index))
             self._report.device_info_logged = True
             return
@@ -846,6 +1335,16 @@ class OpenCVBackendManager:
                 self._report.device_info_logged = True
             except Exception as exc:
                 self._report.warnings.append("Failed to log CUDA device info: {0}".format(exc))
+
+    @staticmethod
+    def _device_name_from_info(device_info: Any) -> str:
+        if device_info is None or not hasattr(device_info, "name"):
+            return ""
+        try:
+            value = getattr(device_info, "name")
+            return str(value() if callable(value) else value)
+        except Exception:
+            return ""
 
 
 class PipelineError(RuntimeError):
@@ -1507,36 +2006,33 @@ class BlurEvaluator:
         if not hasattr(cuda_api, "createLaplacianFilter"):
             raise PipelineError("cv2.cuda.createLaplacianFilter is unavailable in the current OpenCV build.")
 
-        source_image = image.astype(np.float32, copy=False)
+        source_image = image
+        if getattr(source_image, "dtype", None) != np.uint8:
+            source_image = source_image.astype(np.uint8, copy=False)
         gpu_image = cuda_api.GpuMat()
         gpu_image.upload(source_image)
-        gpu_working = gpu_image
+        gpu_working = self._ensure_cuda_grayscale(cuda_api, gpu_image, source_image)
 
         if self.config.cuda_use_gaussian_preblur:
             if not hasattr(cuda_api, "createGaussianFilter"):
                 raise PipelineError("cuda_use_gaussian_preblur requires cv2.cuda.createGaussianFilter.")
             gaussian_filter = cuda_api.createGaussianFilter(
-                self._cv32fc1(),
-                self._cv32fc1(),
+                self._cv8uc1(),
+                self._cv8uc1(),
                 (3, 3),
                 0,
             )
             gpu_working = self._apply_cuda_filter(gaussian_filter, gpu_working)
 
-        laplacian_filter = cuda_api.createLaplacianFilter(self._cv32fc1(), self._cv32fc1(), 3)
+        laplacian_filter = cuda_api.createLaplacianFilter(self._cv8uc1(), self._cv32fc1(), 3)
         gpu_laplacian = self._apply_cuda_filter(laplacian_filter, gpu_working)
-
         mask = self.compute_center70_mask(image)
-        if hasattr(cuda_api, "meanStdDev"):
-            gpu_mask = cuda_api.GpuMat()
-            gpu_mask.upload(mask)
-            _mean, stddev = cuda_api.meanStdDev(gpu_laplacian, gpu_mask)
-            std_array = np.asarray(stddev).reshape(-1)
-            if std_array.size == 0:
-                raise PipelineError("OpenCV CUDA meanStdDev returned no values for blur evaluation.")
-            return float(std_array[0] ** 2)
-
-        laplacian = gpu_laplacian.download()
+        laplacian = self._download_cuda_mat(gpu_laplacian)
+        if laplacian is None or getattr(laplacian, "size", 0) == 0:
+            raise PipelineError("OpenCV CUDA Laplacian download returned no pixels for blur evaluation.")
+        if getattr(laplacian, "ndim", 0) > 2:
+            laplacian = laplacian[:, :, 0]
+        laplacian = np.asarray(laplacian, dtype=np.float64)
         masked_values = laplacian[mask > 0]
         if masked_values.size == 0:
             raise PipelineError("Center-70-percent mask produced no pixels for CUDA blur evaluation.")
@@ -1555,13 +2051,19 @@ class BlurEvaluator:
             except Exception as exc:
                 if not self.config.cuda_allow_fallback:
                     raise PipelineError("CUDA blur evaluation failed with fallback disabled: {0}".format(exc)) from exc
-                reason = "CUDA blur evaluation failed; falling back to CPU: {0}".format(exc)
+                function_name = "BlurEvaluator.laplacian_score_cuda"
+                image_label = str(self._current_image_path) if self._current_image_path else "<unknown>"
+                reason = "{0} failed for image {1}; falling back to CPU: {2}".format(
+                    function_name,
+                    image_label,
+                    exc,
+                )
                 self.backend_manager.fallback_to_cpu(
                     reason,
-                    context="laplacian_score",
+                    context=function_name,
                     image_path=self._current_image_path,
                 )
-                self._log_cuda_fallback(reason)
+                self._log_cuda_fallback(function_name, reason)
                 score = self.laplacian_score_cpu(image)
                 self._set_score_metadata("cpu", True, reason, start_time)
                 return score
@@ -1611,6 +2113,8 @@ class BlurEvaluator:
             "fallback_back": int(bool(back_result["fallback"])),
             "fallback_reason_front": front_result["fallback_reason"],
             "fallback_reason_back": back_result["fallback_reason"],
+            "elapsed_ms_front": front_result["elapsed_ms"],
+            "elapsed_ms_back": back_result["elapsed_ms"],
         }
 
     def select_pairs(self, front_dir: Path, back_dir: Path, out_front_dir: Path, out_back_dir: Path) -> PhaseResult:
@@ -1651,6 +2155,8 @@ class BlurEvaluator:
                 "fallback_back",
                 "fallback_reason_front",
                 "fallback_reason_back",
+                "elapsed_ms_front",
+                "elapsed_ms_back",
             ),
         )
         self.backend_manager.save_backend_report()
@@ -1743,17 +2249,56 @@ class BlurEvaluator:
             "elapsed_ms": elapsed_ms,
         }
 
-    def _log_cuda_fallback(self, reason: str) -> None:
+    def _log_cuda_fallback(self, context: str, reason: str) -> None:
         image_label = str(self._current_image_path) if self._current_image_path else "<unknown>"
-        LOGGER.warning("%s [image=%s]", reason, image_label)
-        self.logs.append_line(
-            self.config.cuda_fallback_log_path,
-            "{0}\t{1}".format(image_label, reason),
-        )
+        LOGGER.warning("%s [context=%s image=%s]", reason, context, image_label)
 
     @staticmethod
     def _cv32fc1() -> int:
         return int(getattr(cv2, "CV_32FC1", cv2.CV_32F))
+
+    @staticmethod
+    def _cv8uc1() -> int:
+        return int(getattr(cv2, "CV_8UC1", cv2.CV_8U))
+
+    @staticmethod
+    def _normalize_cuda_result(result: Any) -> Optional[Any]:
+        if result is None:
+            return None
+        if hasattr(result, "download"):
+            return result
+        if isinstance(result, (tuple, list)):
+            for item in result:
+                if hasattr(item, "download"):
+                    return item
+        return None
+
+    def _ensure_cuda_grayscale(self, cuda_api: Any, gpu_image: Any, source_image: Any) -> Any:
+        """Normalize the uploaded image to a single-channel CUDA mat."""
+
+        if getattr(source_image, "ndim", 0) < 3:
+            return gpu_image
+        if source_image.shape[2] == 1:
+            return gpu_image
+
+        if hasattr(cuda_api, "cvtColor") and hasattr(cv2, "COLOR_BGR2GRAY"):
+            gpu_gray = self._normalize_cuda_result(cuda_api.cvtColor(gpu_image, cv2.COLOR_BGR2GRAY))
+            if gpu_gray is not None:
+                return gpu_gray
+
+        if hasattr(cv2, "cvtColor") and hasattr(cv2, "COLOR_BGR2GRAY"):
+            gray_image = cv2.cvtColor(source_image, cv2.COLOR_BGR2GRAY)
+            gpu_gray = cuda_api.GpuMat()
+            gpu_gray.upload(gray_image)
+            return gpu_gray
+
+        raise PipelineError("Unable to convert a multi-channel image to grayscale for CUDA blur evaluation.")
+
+    @staticmethod
+    def _download_cuda_mat(gpu_mat: Any) -> Any:
+        if gpu_mat is None or not hasattr(gpu_mat, "download"):
+            raise PipelineError("OpenCV CUDA did not return a downloadable GpuMat result.")
+        return gpu_mat.download()
 
     @staticmethod
     def _apply_cuda_filter(cuda_filter: Any, gpu_source: Any) -> Any:
@@ -1761,8 +2306,9 @@ class BlurEvaluator:
 
         try:
             result = cuda_filter.apply(gpu_source)
-            if result is not None:
-                return result
+            normalized_result = BlurEvaluator._normalize_cuda_result(result)
+            if normalized_result is not None:
+                return normalized_result
         except TypeError:
             pass
         gpu_destination = cv2.cuda.GpuMat()
@@ -1794,18 +2340,143 @@ class MaskGenerator:
         self.config = config
         self.logs = logs
         self._model: Optional[Any] = None
+        self._report = YoloBackendReport()
+        self._report_cached = False
+        self._active_device = "cpu"
+        self._resolved_model_path: Optional[Path] = None
+
+    def detect_backend_support(self) -> Dict[str, Any]:
+        """Inspect YOLO / PyTorch CUDA availability and cache the result."""
+
+        if self._report_cached:
+            return self._report.to_dict()
+
+        report = YoloBackendReport(
+            ultralytics_available=YOLO is not None,
+            torch_available=torch is not None,
+            torch_version=getattr(torch, "__version__", "") if torch is not None else "",
+            requested_mode=self.config.yolo_device_mode,
+            selected_device=self._active_device,
+            active_device=self._active_device,
+            prefer_cuda=self.config.prefer_yolo_cuda,
+            allow_fallback=self.config.yolo_allow_fallback,
+            device_index=self.config.yolo_device_index,
+            local_model_path=str(self.config.find_local_mask_model_path() or ""),
+        )
+        if YOLO is None:
+            report.warnings.append("Ultralytics YOLO is not available in this Python runtime.")
+        if torch is None:
+            report.warnings.append("PyTorch is not available in this Python runtime.")
+            self._report = report
+            self._report_cached = True
+            return report.to_dict()
+
+        cuda_api = getattr(torch, "cuda", None)
+        if cuda_api is None or not hasattr(cuda_api, "is_available"):
+            report.warnings.append("torch.cuda is not available in this runtime.")
+            self._report = report
+            self._report_cached = True
+            return report.to_dict()
+
+        try:
+            report.cuda_available = bool(cuda_api.is_available())
+        except Exception as exc:
+            report.warnings.append("Failed to query torch.cuda.is_available(): {0}".format(exc))
+            report.cuda_available = False
+        try:
+            report.cuda_device_count = int(cuda_api.device_count())
+        except Exception as exc:
+            report.warnings.append("Failed to query torch.cuda.device_count(): {0}".format(exc))
+            report.cuda_device_count = 0
+
+        if report.cuda_available and report.cuda_device_count > 0:
+            for device_index in range(report.cuda_device_count):
+                try:
+                    report.device_names.append(str(cuda_api.get_device_name(device_index)))
+                except Exception:
+                    report.device_names.append("cuda:{0}".format(device_index))
+        elif self.config.yolo_device_mode == "cuda" or self.config.prefer_yolo_cuda:
+            report.warnings.append("PyTorch CUDA device is not available; YOLO will use CPU when fallback is allowed.")
+
+        self._report = report
+        self._report_cached = True
+        return report.to_dict()
+
+    def resolve_device(self) -> str:
+        """Choose the effective device for YOLO inference."""
+
+        self.detect_backend_support()
+        if self._model is not None and self._active_device:
+            return self._active_device
+        explicit_device = str(self.config.mask_device).strip() if self.config.mask_device else ""
+        if explicit_device:
+            self._report.notes.append("Using explicit mask_device override from config.")
+            self._report.selected_device = explicit_device
+            self._active_device = explicit_device
+            return explicit_device
+
+        requested = self.config.yolo_device_mode
+        self._report.requested_mode = requested
+        self._report.prefer_cuda = self.config.prefer_yolo_cuda
+        self._report.allow_fallback = self.config.yolo_allow_fallback
+        self._report.device_index = self.config.yolo_device_index
+
+        if requested == "cpu":
+            self._report.selected_device = "cpu"
+            self._active_device = "cpu"
+            return "cpu"
+
+        if requested == "auto" and not self.config.prefer_yolo_cuda:
+            self._report.notes.append("prefer_yolo_cuda=False forced CPU selection while yolo_device_mode=auto.")
+            self._report.selected_device = "cpu"
+            self._active_device = "cpu"
+            return "cpu"
+
+        cuda_ready = self._report.cuda_available and self._report.cuda_device_count > self.config.yolo_device_index
+        if requested == "cuda":
+            if cuda_ready:
+                device = "cuda:{0}".format(self.config.yolo_device_index)
+                self._set_active_device(device)
+                return device
+            reason = self._cuda_unavailable_reason()
+            if self.config.yolo_allow_fallback:
+                self.record_fallback(reason, context="device_selection", requested_device="cuda")
+                self._set_active_device("cpu")
+                return "cpu"
+            raise PipelineError(reason)
+
+        if requested == "auto":
+            if cuda_ready:
+                device = "cuda:{0}".format(self.config.yolo_device_index)
+                self._set_active_device(device)
+                return device
+            reason = self._cuda_unavailable_reason()
+            self.record_fallback(reason, context="device_selection", requested_device="auto")
+            self._set_active_device("cpu")
+            return "cpu"
+
+        raise PipelineError("Unsupported yolo_device_mode: {0}".format(requested))
 
     def load_model(self) -> Any:
         """Load the configured YOLO segmentation model once per run."""
 
         self._require_yolo_runtime()
         if self._model is None:
+            resolved_model_path = self.config.resolve_mask_model_path()
+            selected_device = self.resolve_device()
+            self._resolved_model_path = resolved_model_path
+            self._report.local_model_path = str(resolved_model_path)
+            LOGGER.info("Loading YOLO model from local path: %s", resolved_model_path)
+            LOGGER.info("YOLO inference device selection: %s", selected_device)
             try:
-                self._model = YOLO(self.config.mask_model_path)
+                self._model = YOLO(str(resolved_model_path))
             except Exception as exc:
                 raise PipelineError(
-                    "Failed to load YOLO model from '{0}'.".format(self.config.mask_model_path)
+                    "Failed to load YOLO model from local file '{0}'.".format(resolved_model_path)
                 ) from exc
+            self._report.model_loaded = True
+            self._report.active_device = self._active_device
+            self.save_backend_report()
         return self._model
 
     def infer_mask(self, image_path: Path) -> Dict[str, Any]:
@@ -1817,19 +2488,28 @@ class MaskGenerator:
             raise PipelineError("Failed to read image for mask generation: {0}".format(image_path))
 
         model = self.load_model()
+        device = self.resolve_device()
         predict_kwargs: Dict[str, Any] = {
             "source": str(image_path),
             "verbose": False,
             "conf": self.config.mask_confidence_threshold,
             "iou": self.config.mask_iou_threshold,
+            "device": device,
         }
-        if self.config.mask_device:
-            predict_kwargs["device"] = self.config.mask_device
 
         try:
             results = model.predict(**predict_kwargs)
         except Exception as exc:
-            raise PipelineError("YOLO inference failed for {0}.".format(image_path.name)) from exc
+            if self._is_cuda_device(device) and self.config.yolo_allow_fallback:
+                reason = "YOLO CUDA inference failed for {0}; fallback to CPU: {1}".format(image_path.name, exc)
+                self.fallback_to_cpu(reason, context="predict", image_path=image_path)
+                predict_kwargs["device"] = "cpu"
+                try:
+                    results = model.predict(**predict_kwargs)
+                except Exception as fallback_exc:
+                    raise PipelineError("YOLO inference failed for {0}.".format(image_path.name)) from fallback_exc
+            else:
+                raise PipelineError("YOLO inference failed for {0}.".format(image_path.name)) from exc
         if not results:
             raise PipelineError("YOLO did not return a result for {0}.".format(image_path.name))
 
@@ -1913,6 +2593,8 @@ class MaskGenerator:
     def run(self) -> PhaseResult:
         """Generate binary mask PNGs for each selected front/back pair."""
 
+        self.detect_backend_support()
+        self.save_backend_report()
         pairs = collect_frame_pairs(self.config.selected_front_dir, self.config.selected_back_dir)
         self._clear_directory(self.config.mask_front_dir, "F_*.png")
         self._clear_directory(self.config.mask_back_dir, "B_*.png")
@@ -1943,6 +2625,7 @@ class MaskGenerator:
                 "dilate_px",
             ),
         )
+        self.save_backend_report()
         return PhaseResult(
             phase="generate_masks",
             status="ok",
@@ -1952,8 +2635,92 @@ class MaskGenerator:
                 "image_count": len(rows),
                 "masked_image_count": masked_images,
                 "mask_summary_csv": self.config.mask_summary_log_path,
+                "yolo_device": self._active_device,
+                "yolo_backend_report": self.config.yolo_backend_report_path,
             },
         )
+
+    def build_backend_report(self) -> Dict[str, Any]:
+        """Return a serializable YOLO backend report with current fallback state."""
+
+        self.detect_backend_support()
+        self._report.selected_device = self._report.selected_device or self._active_device
+        self._report.active_device = self._active_device
+        if self._resolved_model_path is not None:
+            self._report.local_model_path = str(self._resolved_model_path)
+        payload = self._report.to_dict()
+        payload["backend_report_path"] = str(self.config.yolo_backend_report_path)
+        payload["save_backend_report"] = self.config.save_backend_report
+        return payload
+
+    def save_backend_report(self) -> None:
+        if self.config.save_backend_report:
+            self.logs.write_json(self.config.yolo_backend_report_path, self.build_backend_report())
+
+    def record_fallback(
+        self,
+        reason: str,
+        context: str,
+        requested_device: Optional[str] = None,
+        image_path: Optional[Path] = None,
+    ) -> None:
+        clean_reason = str(reason).strip() or "Unknown YOLO fallback reason."
+        if clean_reason not in self._report.fallback_reasons:
+            self._report.fallback_reasons.append(clean_reason)
+        event = {
+            "context": context,
+            "reason": clean_reason,
+            "requested_device": requested_device or self.config.yolo_device_mode,
+            "image_path": str(image_path) if image_path else "",
+        }
+        self._report.fallback_events.append(event)
+        LOGGER.warning("YOLO backend fallback [%s]: %s", context, clean_reason)
+        self.logs.append_line(
+            self.config.cuda_fallback_log_path,
+            "yolo\t{0}\t{1}\t{2}\t{3}".format(
+                context,
+                event["requested_device"],
+                event["image_path"] or "<unknown>",
+                clean_reason,
+            ),
+        )
+
+    def fallback_to_cpu(self, reason: str, context: str, image_path: Optional[Path] = None) -> None:
+        self.record_fallback(reason, context=context, image_path=image_path)
+        self._set_active_device("cpu")
+        self.save_backend_report()
+
+    def _set_active_device(self, device: str) -> None:
+        self._active_device = device
+        self._report.selected_device = device
+        self._report.active_device = device
+        if device.startswith("cuda:"):
+            try:
+                device_index = int(device.split(":", 1)[1])
+            except ValueError:
+                device_index = 0
+            if len(self._report.device_names) > device_index:
+                self._report.device_name = self._report.device_names[device_index]
+        else:
+            self._report.device_name = "cpu"
+
+    @staticmethod
+    def _is_cuda_device(device: str) -> bool:
+        return str(device).startswith("cuda")
+
+    def _cuda_unavailable_reason(self) -> str:
+        if YOLO is None:
+            return "Ultralytics YOLO is not available in this Python runtime."
+        if torch is None:
+            return "PyTorch is not available in this Python runtime."
+        if not self._report.cuda_available or self._report.cuda_device_count <= 0:
+            return "CUDA is not available for YOLO inference."
+        if self._report.cuda_device_count <= self.config.yolo_device_index:
+            return "yolo_device_index={0} is out of range for {1} detected CUDA device(s).".format(
+                self.config.yolo_device_index,
+                self._report.cuda_device_count,
+            )
+        return "YOLO CUDA device selection failed."
 
     @staticmethod
     def _clear_directory(directory: Path, pattern: str) -> None:
@@ -2836,6 +3603,7 @@ class PipelineController:
         self.extractor = FFmpegExtractor(self.config, self.logs)
         self.blur_evaluator = BlurEvaluator(self.config, self.logs)
         self.mask_generator = MaskGenerator(self.config, self.logs)
+        self.gpu_status = GpuStatusAggregator(self.config, self.logs)
         self.importer = MetashapeImporter(self.config)
         self.aligner = MetashapeAligner(self.config, self.logs)
         self.overlap_reducer = OverlapReducer(self.config, self.logs)
@@ -2916,6 +3684,15 @@ class PipelineController:
             "opencv_backend_report.json": self.config.opencv_backend_report_path.exists()
             if self.config.save_backend_report
             else False,
+            "yolo_backend_report.json": self.config.yolo_backend_report_path.exists()
+            if self.config.save_backend_report
+            else False,
+            "metashape_gpu_report.json": self.config.metashape_gpu_report_path.exists()
+            if self.config.save_backend_report
+            else False,
+            "gpu_summary_report.json": self.config.gpu_summary_report_path.exists()
+            if self.config.save_backend_report
+            else False,
             "mask_summary.csv": self.config.mask_summary_log_path.exists(),
             "metashape_quality.csv": self.config.metashape_quality_log_path.exists(),
             "overlap_reduction.csv": self.config.overlap_reduction_log_path.exists(),
@@ -2923,11 +3700,19 @@ class PipelineController:
             "error.log": self.config.error_log_path.exists(),
             "cuda_fallback.log": self.config.cuda_fallback_log_path.exists(),
         }
+        gpu_reports = self.gpu_status.collect_all(
+            self.blur_evaluator.backend_manager,
+            self.mask_generator,
+            save=self.config.save_backend_report,
+        )
         summary: Dict[str, Any] = {
             "config": self.config.to_dict(),
             "required_logs": required_logs,
             "existing_logs": sorted(path.name for path in self.config.log_dir.glob("*") if path.is_file()),
-            "opencv_backend": self.blur_evaluator.backend_manager.build_backend_report(),
+            "opencv_backend": gpu_reports["opencv"],
+            "yolo_backend": gpu_reports["yolo"],
+            "metashape_gpu": gpu_reports["metashape"],
+            "gpu_summary": gpu_reports["summary"],
         }
         if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
             chunk = Metashape.app.document.chunk
@@ -3176,6 +3961,7 @@ class PipelineController:
     def _run_export_logs_impl(self) -> PhaseResult:
         self._set_step("export_logs", "write_summary", 1, 1)
         self.blur_evaluator.backend_manager.save_backend_report()
+        self.mask_generator.save_backend_report()
         summary = self.build_log_summary()
         self.logs.write_summary(self.config.summary_log_path, summary)
         return PhaseResult(
@@ -3213,6 +3999,12 @@ class PipelineController:
                     "failed_step": self._current_step or phase_name,
                 },
             )
+        finally:
+            if self.config.save_backend_report:
+                try:
+                    self.gpu_status.collect_all(self.blur_evaluator.backend_manager, self.mask_generator, save=True)
+                except Exception as gpu_exc:
+                    LOGGER.warning("Failed to write GPU summary reports: %s", gpu_exc)
 
 
 class DualFisheyePipeline:
@@ -3234,6 +4026,7 @@ class DualFisheyePipeline:
         self.extractor = self.controller.extractor
         self.blur_evaluator = self.controller.blur_evaluator
         self.mask_generator = self.controller.mask_generator
+        self.gpu_status = self.controller.gpu_status
         self.importer = self.controller.importer
         self.aligner = self.controller.aligner
         self.overlap_reducer = self.controller.overlap_reducer
@@ -3297,17 +4090,17 @@ if QtWidgets is not None:
             super().closeEvent(event)
 
         def _build_ui(self) -> None:
-            self.setWindowTitle("Dual Fisheye Pipeline")
+            self.setWindowTitle("デュアル魚眼パイプライン")
             self.resize(980, 760)
 
             root_layout = QtWidgets.QVBoxLayout(self)
 
             config_button_row = QtWidgets.QHBoxLayout()
-            save_button = QtWidgets.QPushButton("Save Config")
+            save_button = QtWidgets.QPushButton("設定保存")
             save_button.clicked.connect(self.save_config)
-            load_button = QtWidgets.QPushButton("Load Config")
+            load_button = QtWidgets.QPushButton("設定読込")
             load_button.clicked.connect(self.load_config)
-            reset_button = QtWidgets.QPushButton("Reset to Default")
+            reset_button = QtWidgets.QPushButton("初期値に戻す")
             reset_button.clicked.connect(self.reset_to_default)
             config_button_row.addWidget(save_button)
             config_button_row.addWidget(load_button)
@@ -3317,11 +4110,11 @@ if QtWidgets is not None:
 
             self._action_buttons.extend([save_button, load_button, reset_button])
 
-            self.status_label = QtWidgets.QLabel("Ready")
+            self.status_label = QtWidgets.QLabel("準備完了")
             self.status_label.setStyleSheet("padding: 6px; border: 1px solid #bcbcbc;")
             root_layout.addWidget(self.status_label)
 
-            self.progress_label = QtWidgets.QLabel("Idle")
+            self.progress_label = QtWidgets.QLabel("待機中")
             root_layout.addWidget(self.progress_label)
 
             self.progress_bar = QtWidgets.QProgressBar()
@@ -3330,11 +4123,11 @@ if QtWidgets is not None:
             root_layout.addWidget(self.progress_bar)
 
             tabs = QtWidgets.QTabWidget()
-            tabs.addTab(self._build_basic_tab(), "Basic")
-            tabs.addTab(self._build_preprocess_tab(), "Preprocess")
-            tabs.addTab(self._build_mask_import_tab(), "Mask / Import")
-            tabs.addTab(self._build_align_tab(), "Align / Reduce")
-            tabs.addTab(self._build_logs_tab(), "Logs / Summary")
+            tabs.addTab(self._build_basic_tab(), "基本設定")
+            tabs.addTab(self._build_preprocess_tab(), "前処理")
+            tabs.addTab(self._build_mask_import_tab(), "マスク / 読込")
+            tabs.addTab(self._build_align_tab(), "アライメント / 間引き")
+            tabs.addTab(self._build_logs_tab(), "ログ / 状態")
             root_layout.addWidget(tabs)
 
         def _build_basic_tab(self) -> Any:
@@ -3343,22 +4136,22 @@ if QtWidgets is not None:
             form = QtWidgets.QFormLayout()
 
             form.addRow(
-                "Input OSV",
+                "入力OSV",
                 self._build_path_field(
                     "input_mp4",
                     directory=False,
-                    dialog_title="Select OSV",
+                    dialog_title="OSVを選択",
                     file_filter="OSV Files (*.osv);;All Files (*)",
                     placeholder=_INPUT_OSV_PLACEHOLDER,
                 ),
             )
-            form.addRow("Work Folder", self._build_path_field("work_root", directory=True))
-            form.addRow("Front Stream Index", self._register_widget("front_stream_index", self._spin_box(0, 99)))
-            form.addRow("Back Stream Index", self._register_widget("back_stream_index", self._spin_box(0, 99)))
+            form.addRow("作業フォルダ", self._build_path_field("work_root", directory=True))
+            form.addRow("前方ストリーム番号", self._register_widget("front_stream_index", self._spin_box(0, 99)))
+            form.addRow("後方ストリーム番号", self._register_widget("back_stream_index", self._spin_box(0, 99)))
 
             layout.addLayout(form)
 
-            run_button = QtWidgets.QPushButton("Run Full Pipeline")
+            run_button = QtWidgets.QPushButton("フル実行")
             run_button.clicked.connect(lambda: self._run_action("run_full_pipeline", self.pipeline.run_full_pipeline))
             self._action_buttons.append(run_button)
             layout.addWidget(run_button)
@@ -3371,61 +4164,61 @@ if QtWidgets is not None:
             form = QtWidgets.QFormLayout()
 
             form.addRow(
-                "Extract Every N Frames",
+                "何フレームごとに抽出",
                 self._register_widget("extract_every_n_frames", self._spin_box(1, 10000)),
             )
             form.addRow(
-                "Blur Threshold Front",
+                "前方ブレ閾値",
                 self._register_widget("blur_threshold_front", self._double_spin_box(0.0, 100000.0, 4)),
             )
             form.addRow(
-                "Blur Threshold Back",
+                "後方ブレ閾値",
                 self._register_widget("blur_threshold_back", self._double_spin_box(0.0, 100000.0, 4)),
             )
-            form.addRow("FFT Blur Threshold", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
-            form.addRow("JPEG Quality", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
+            form.addRow("FFTブレ閾値", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
+            form.addRow("JPEG品質", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
             form.addRow(
-                "OpenCV Backend",
+                "OpenCV実行方式",
                 self._register_widget("opencv_backend", self._combo_box(("auto", "cpu", "cuda"))),
             )
             form.addRow(
-                "Prefer CUDA",
-                self._register_widget("prefer_cuda", QtWidgets.QCheckBox("Use CUDA first when auto is selected")),
+                "CUDAを優先",
+                self._register_widget("prefer_cuda", QtWidgets.QCheckBox("auto 選択時に CUDA を優先する")),
             )
             form.addRow(
-                "CUDA Device Index",
+                "CUDAデバイス番号",
                 self._register_widget("cuda_device_index", self._spin_box(0, 31)),
             )
             form.addRow(
-                "Allow CPU Fallback",
-                self._register_widget("cuda_allow_fallback", QtWidgets.QCheckBox("Fallback to CPU when CUDA fails")),
+                "CPUフォールバックを許可",
+                self._register_widget("cuda_allow_fallback", QtWidgets.QCheckBox("CUDA 失敗時に CPU へ切り替える")),
             )
             form.addRow(
-                "Log CUDA Device Info",
-                self._register_widget("cuda_log_device_info", QtWidgets.QCheckBox("Log device details on selection")),
+                "CUDAデバイス情報を記録",
+                self._register_widget("cuda_log_device_info", QtWidgets.QCheckBox("選択したデバイス情報をログに出力する")),
             )
             form.addRow(
-                "CUDA Gaussian Preblur",
+                "CUDAガウシアン事前ぼかし",
                 self._register_widget(
                     "cuda_use_gaussian_preblur",
-                    QtWidgets.QCheckBox("Apply optional CUDA Gaussian preblur before Laplacian"),
+                    QtWidgets.QCheckBox("Laplacian 前に任意の CUDA ガウシアンぼかしを適用する"),
                 ),
             )
             form.addRow(
-                "CUDA Benchmark Mode",
-                self._register_widget("cuda_benchmark_mode", QtWidgets.QCheckBox("Record per-image timing metadata")),
+                "CUDAベンチマークモード",
+                self._register_widget("cuda_benchmark_mode", QtWidgets.QCheckBox("画像ごとの処理時間を記録する")),
             )
             form.addRow(
-                "Save Backend Report",
-                self._register_widget("save_backend_report", QtWidgets.QCheckBox("Write opencv_backend_report.json")),
+                "backend report を保存",
+                self._register_widget("save_backend_report", QtWidgets.QCheckBox("GPU 状態レポート JSON を保存する")),
             )
 
             layout.addLayout(form)
 
             button_row = QtWidgets.QHBoxLayout()
-            extract_button = QtWidgets.QPushButton("Extract Streams")
+            extract_button = QtWidgets.QPushButton("ストリーム抽出")
             extract_button.clicked.connect(lambda: self._run_action("extract_streams", self.pipeline.run_extract_streams))
-            select_button = QtWidgets.QPushButton("Select Frames")
+            select_button = QtWidgets.QPushButton("フレーム選別")
             select_button.clicked.connect(lambda: self._run_action("select_frames", self.pipeline.run_select_frames))
             button_row.addWidget(extract_button)
             button_row.addWidget(select_button)
@@ -3440,16 +4233,32 @@ if QtWidgets is not None:
             layout = QtWidgets.QVBoxLayout(tab)
             form = QtWidgets.QFormLayout()
 
-            form.addRow("YOLO Model Path", self._build_path_field("mask_model_path", directory=False))
-            form.addRow("Mask Classes", self._register_widget("mask_classes", QtWidgets.QLineEdit()))
-            form.addRow("Mask Dilate Px", self._register_widget("mask_dilate_px", self._spin_box(0, 1024)))
+            form.addRow("YOLOモデルパス", self._build_path_field("mask_model_path", directory=False))
+            form.addRow("マスク対象クラス", self._register_widget("mask_classes", QtWidgets.QLineEdit()))
+            form.addRow("マスク膨張ピクセル", self._register_widget("mask_dilate_px", self._spin_box(0, 1024)))
+            form.addRow(
+                "YOLO実行方式",
+                self._register_widget("yolo_device_mode", self._combo_box(("auto", "cpu", "cuda"))),
+            )
+            form.addRow(
+                "YOLOでCUDAを優先",
+                self._register_widget("prefer_yolo_cuda", QtWidgets.QCheckBox("auto 選択時に CUDA を優先する")),
+            )
+            form.addRow(
+                "YOLO CPUフォールバックを許可",
+                self._register_widget("yolo_allow_fallback", QtWidgets.QCheckBox("CUDA 失敗時に CPU へ切り替える")),
+            )
+            form.addRow(
+                "YOLOデバイス番号",
+                self._register_widget("yolo_device_index", self._spin_box(0, 31)),
+            )
 
             layout.addLayout(form)
 
             button_row = QtWidgets.QHBoxLayout()
-            mask_button = QtWidgets.QPushButton("Generate Masks")
+            mask_button = QtWidgets.QPushButton("マスク生成")
             mask_button.clicked.connect(lambda: self._run_action("generate_masks", self.pipeline.run_generate_masks))
-            import_button = QtWidgets.QPushButton("Import to Metashape")
+            import_button = QtWidgets.QPushButton("Metashapeへ読込")
             import_button.clicked.connect(
                 lambda: self._run_action("import_to_metashape", self.pipeline.run_import_to_metashape)
             )
@@ -3467,44 +4276,44 @@ if QtWidgets is not None:
             form = QtWidgets.QFormLayout()
 
             form.addRow(
-                "Image Quality Threshold",
+                "画質閾値",
                 self._register_widget(
                     "metashape_image_quality_threshold",
                     self._double_spin_box(0.0, 1.0, 3, single_step=0.05),
                 ),
             )
-            form.addRow("Keypoint Limit", self._register_widget("keypoint_limit", self._spin_box(1, 10000000)))
-            form.addRow("Tiepoint Limit", self._register_widget("tiepoint_limit", self._spin_box(1, 10000000)))
+            form.addRow("キーポイント上限", self._register_widget("keypoint_limit", self._spin_box(1, 10000000)))
+            form.addRow("タイポイント上限", self._register_widget("tiepoint_limit", self._spin_box(1, 10000000)))
             form.addRow(
-                "Camera Distance Threshold",
+                "カメラ距離閾値",
                 self._register_widget("camera_distance_threshold", self._double_spin_box(0.0, 1000.0, 4)),
             )
             form.addRow(
-                "Camera Angle Threshold Deg",
+                "カメラ角度閾値（度）",
                 self._register_widget("camera_angle_threshold_deg", self._double_spin_box(0.0, 180.0, 4)),
             )
-            form.addRow("Overlap Target", self._register_widget("overlap_target", self._spin_box(1, 99)))
+            form.addRow("重複目標枚数", self._register_widget("overlap_target", self._spin_box(1, 99)))
             form.addRow(
-                "Enable Rig Reference",
-                self._register_widget("enable_rig_reference", QtWidgets.QCheckBox("Use rig reference")),
+                "rig参照を有効化",
+                self._register_widget("enable_rig_reference", QtWidgets.QCheckBox("rig 参照を使用する")),
             )
             form.addRow(
-                "Rig Relative Location",
+                "rig相対位置",
                 self._register_widget("rig_relative_location", QtWidgets.QLineEdit()),
             )
             form.addRow(
-                "Rig Relative Rotation",
+                "rig相対回転",
                 self._register_widget("rig_relative_rotation", QtWidgets.QLineEdit()),
             )
 
             layout.addLayout(form)
 
             button_row = QtWidgets.QHBoxLayout()
-            align_button = QtWidgets.QPushButton("Align")
+            align_button = QtWidgets.QPushButton("アライメント")
             align_button.clicked.connect(lambda: self._run_action("align", self.pipeline.run_align))
-            reduce_button = QtWidgets.QPushButton("Reduce Overlap")
+            reduce_button = QtWidgets.QPushButton("冗長画像削減")
             reduce_button.clicked.connect(lambda: self._run_action("reduce_overlap", self.pipeline.run_reduce_overlap))
-            export_button = QtWidgets.QPushButton("Export Logs")
+            export_button = QtWidgets.QPushButton("ログ出力")
             export_button.clicked.connect(lambda: self._run_action("export_logs", self.pipeline.run_export_logs))
             button_row.addWidget(align_button)
             button_row.addWidget(reduce_button)
@@ -3519,21 +4328,23 @@ if QtWidgets is not None:
             tab = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(tab)
 
-            summary_group = QtWidgets.QGroupBox("Summary")
+            summary_group = QtWidgets.QGroupBox("集計 / GPU状態")
             summary_form = QtWidgets.QFormLayout(summary_group)
             for key, label in (
-                ("selected_pairs", "Selected Pairs"),
-                ("discarded_pairs", "Discarded Pairs"),
-                ("mask_rows", "Mask Rows"),
-                ("masked_images", "Masked Images"),
-                ("quality_rows", "Quality Rows"),
-                ("overlap_rows", "Overlap Rows"),
-                ("enabled_cameras", "Enabled Cameras"),
-                ("aligned_cameras", "Aligned Cameras"),
-                ("opencv_backend", "Current Backend"),
-                ("cuda_device_count", "CUDA Device Count"),
-                ("cuda_fallback", "Fallback Detected"),
-                ("backend_report_path", "Backend Report Path"),
+                ("selected_pairs", "採用ペア数"),
+                ("discarded_pairs", "除外ペア数"),
+                ("mask_rows", "マスク行数"),
+                ("masked_images", "マスクあり画像数"),
+                ("quality_rows", "画質ログ行数"),
+                ("overlap_rows", "間引きログ行数"),
+                ("enabled_cameras", "有効カメラ数"),
+                ("aligned_cameras", "アライメント済みカメラ数"),
+                ("opencv_status", "OpenCV状態"),
+                ("yolo_status", "YOLO状態"),
+                ("metashape_gpu_status", "Metashape GPU状態"),
+                ("gpu_fallback", "GPUフォールバック"),
+                ("device_indices", "使用デバイス番号"),
+                ("backend_report_paths", "backend report 保存先"),
             ):
                 value_label = QtWidgets.QLabel("-")
                 self._summary_labels[key] = value_label
@@ -3566,7 +4377,7 @@ if QtWidgets is not None:
             line_edit.editingFinished.connect(
                 lambda name=name, widget=line_edit: self._sync_path_field_value(name, widget.text())
             )
-            browse_button = QtWidgets.QPushButton("Browse")
+            browse_button = QtWidgets.QPushButton("参照")
             browse_button.clicked.connect(lambda: self._browse_path(name, directory, dialog_title, file_filter))
             row.addWidget(line_edit, 1)
             row.addWidget(browse_button)
@@ -3630,13 +4441,13 @@ if QtWidgets is not None:
             if directory:
                 selected_path = QtWidgets.QFileDialog.getExistingDirectory(
                     self,
-                    dialog_title or "Select Directory",
+                    dialog_title or "フォルダを選択",
                     start_dir,
                 )
             else:
                 selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
                     self,
-                    dialog_title or "Select File",
+                    dialog_title or "ファイルを選択",
                     start_dir,
                     file_filter,
                 )
@@ -3664,6 +4475,10 @@ if QtWidgets is not None:
             self._widgets["cuda_log_device_info"].setChecked(config.cuda_log_device_info)
             self._widgets["cuda_use_gaussian_preblur"].setChecked(config.cuda_use_gaussian_preblur)
             self._widgets["cuda_benchmark_mode"].setChecked(config.cuda_benchmark_mode)
+            self._widgets["yolo_device_mode"].setCurrentText(config.yolo_device_mode)
+            self._widgets["prefer_yolo_cuda"].setChecked(config.prefer_yolo_cuda)
+            self._widgets["yolo_allow_fallback"].setChecked(config.yolo_allow_fallback)
+            self._widgets["yolo_device_index"].setValue(config.yolo_device_index)
             self._widgets["save_backend_report"].setChecked(config.save_backend_report)
             self._widgets["mask_classes"].setText(", ".join(config.mask_classes))
             self._widgets["mask_dilate_px"].setValue(config.mask_dilate_px)
@@ -3681,6 +4496,7 @@ if QtWidgets is not None:
                 ", ".join(str(value) for value in config.rig_relative_rotation)
             )
             self._refresh_input_osv_field_state()
+            self._refresh_mask_model_field_state()
 
         def _sync_path_field_value(self, name: str, value: str, announce: bool = False) -> None:
             updated = PipelineConfig.from_mapping(self.config.to_dict())
@@ -3689,10 +4505,14 @@ if QtWidgets is not None:
             self.pipeline = self._build_pipeline(self.config)
             if name == "input_mp4":
                 self._refresh_input_osv_field_state(
-                    status_prefix="Updated Input OSV selection." if announce else None
+                    status_prefix="入力OSVを更新しました。" if announce else None
+                )
+            elif name == "mask_model_path":
+                self._refresh_mask_model_field_state(
+                    status_prefix="YOLOモデルパスを更新しました。" if announce else None
                 )
             elif name == "work_root" and announce:
-                self._set_status("info", "Work root changed. Save or run to persist the new config path.")
+                self._set_status("info", "作業フォルダを変更しました。保存または実行すると設定パスが反映されます。")
             if name in ("input_mp4", "work_root"):
                 self.refresh_summary()
 
@@ -3716,6 +4536,10 @@ if QtWidgets is not None:
                     "cuda_log_device_info": self._widgets["cuda_log_device_info"].isChecked(),
                     "cuda_use_gaussian_preblur": self._widgets["cuda_use_gaussian_preblur"].isChecked(),
                     "cuda_benchmark_mode": self._widgets["cuda_benchmark_mode"].isChecked(),
+                    "yolo_device_mode": self._widgets["yolo_device_mode"].currentText(),
+                    "prefer_yolo_cuda": self._widgets["prefer_yolo_cuda"].isChecked(),
+                    "yolo_allow_fallback": self._widgets["yolo_allow_fallback"].isChecked(),
+                    "yolo_device_index": self._widgets["yolo_device_index"].value(),
                     "save_backend_report": self._widgets["save_backend_report"].isChecked(),
                     "mask_model_path": self._widgets["mask_model_path"].text().strip(),
                     "mask_classes": self._widgets["mask_classes"].text().strip(),
@@ -3736,6 +4560,7 @@ if QtWidgets is not None:
             self.config = config
             self.pipeline = self._build_pipeline(self.config)
             self._refresh_input_osv_field_state()
+            self._refresh_mask_model_field_state()
 
         def _refresh_input_osv_field_state(self, status_prefix: Optional[str] = None) -> None:
             input_widget = self._widgets.get("input_mp4")
@@ -3744,7 +4569,7 @@ if QtWidgets is not None:
             issue = self.config.input_video_validation_error(require_exists=True)
             if issue is None:
                 input_widget.setStyleSheet("")
-                input_widget.setToolTip("OSV container is ready for ffprobe / ffmpeg.")
+                input_widget.setToolTip("ffprobe / ffmpeg に渡せる OSV コンテナです。")
                 if status_prefix:
                     self._set_status("ok", status_prefix)
                 return
@@ -3756,15 +4581,48 @@ if QtWidgets is not None:
             elif not input_widget.text().strip():
                 self._set_status("warning", str(issue))
 
+        def _refresh_mask_model_field_state(self, status_prefix: Optional[str] = None) -> None:
+            model_widget = self._widgets.get("mask_model_path")
+            if model_widget is None:
+                return
+
+            issue = self.config.mask_model_validation_error()
+            if issue is None:
+                resolved_path = self.config.find_local_mask_model_path()
+                model_widget.setStyleSheet("")
+                model_widget.setToolTip(
+                    "ローカル YOLO モデルを利用できます: {0}".format(
+                        resolved_path if resolved_path is not None else ""
+                    )
+                )
+                if status_prefix:
+                    self._set_status("ok", status_prefix)
+                return
+
+            model_widget.setStyleSheet("border: 1px solid #c98900; background: #fff8e1;")
+            model_widget.setToolTip(str(issue))
+            if status_prefix:
+                self._set_status("warning", "{0} {1}".format(status_prefix, issue))
+
+        def _config_issue_messages(self) -> List[str]:
+            messages: List[str] = []
+            input_issue = self.config.input_video_validation_error(require_exists=True)
+            model_issue = self.config.mask_model_validation_error()
+            if input_issue is not None:
+                messages.append(str(input_issue))
+            if model_issue is not None:
+                messages.append(str(model_issue))
+            return messages
+
         def _save_last_used_config(self, silent: bool = False) -> None:
             try:
                 self._sync_config_from_widgets()
                 target_path = self.persistence.save(self.config)
                 if not silent:
-                    self._set_status("ok", "Saved config to {0}".format(target_path))
+                    self._set_status("ok", "設定を保存しました: {0}".format(target_path))
             except Exception as exc:
                 if not silent:
-                    self._set_status("error", "Failed to save config: {0}".format(exc))
+                    self._set_status("error", "設定の保存に失敗しました: {0}".format(exc))
 
         def _load_last_used_config_if_available(self) -> bool:
             candidate_paths: List[Path] = []
@@ -3786,11 +4644,11 @@ if QtWidgets is not None:
                 self.config = loaded
                 self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
-                issue = self.config.input_video_validation_error(require_exists=True)
-                status = "ok" if issue is None else "warning"
-                message = "Loaded previous config from {0}".format(candidate_path)
-                if issue is not None:
-                    message = "{0}. {1}".format(message, issue)
+                issues = self._config_issue_messages()
+                status = "ok" if not issues else "warning"
+                message = "前回の設定を読み込みました: {0}".format(candidate_path)
+                if issues:
+                    message = "{0}. {1}".format(message, " ".join(issues))
                 self._set_status(status, message)
                 return True
             return False
@@ -3802,7 +4660,7 @@ if QtWidgets is not None:
             current_dir = str(self.config.config_dir if self.config.config_dir.exists() else self.config.project_root)
             selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self,
-                "Load Config JSON",
+                "設定JSONを読み込む",
                 current_dir,
                 "JSON Files (*.json);;All Files (*)",
             )
@@ -3814,21 +4672,21 @@ if QtWidgets is not None:
                 self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
                 self.refresh_summary()
-                issue = self.config.input_video_validation_error(require_exists=True)
-                status = "ok" if issue is None else "warning"
-                message = "Loaded config from {0}".format(selected_path)
-                if issue is not None:
-                    message = "{0}. {1}".format(message, issue)
+                issues = self._config_issue_messages()
+                status = "ok" if not issues else "warning"
+                message = "設定を読み込みました: {0}".format(selected_path)
+                if issues:
+                    message = "{0}. {1}".format(message, " ".join(issues))
                 self._set_status(status, message)
             except Exception as exc:
-                self._set_status("error", "Failed to load config: {0}".format(exc))
+                self._set_status("error", "設定の読込に失敗しました: {0}".format(exc))
 
         def reset_to_default(self) -> None:
             self.config = PipelineConfig()
             self.pipeline = self._build_pipeline(self.config)
             self._populate_widgets_from_config(self.config)
             self.refresh_summary()
-            self._refresh_input_osv_field_state("Reset GUI fields to default config values.")
+            self._refresh_input_osv_field_state("GUIの設定値を初期値に戻しました。")
 
         def _run_action(self, action_name: str, runner: Callable[[], PhaseResult]) -> None:
             self._set_running(True)
@@ -3836,7 +4694,7 @@ if QtWidgets is not None:
                 self._sync_config_from_widgets()
                 self._validate_preprocess_backend_action(action_name)
                 self.persistence.save(self.config)
-                self._set_status("info", "Running {0}...".format(action_name))
+                self._set_status("info", "{0}を実行中...".format(JapaneseUiText.action_label(action_name)))
                 result = runner()
                 failed_step = result.details.get("failed_step", "") if result.details else ""
                 if result.status == "error":
@@ -3859,15 +4717,15 @@ if QtWidgets is not None:
             for button in self._action_buttons:
                 button.setEnabled(not is_running)
             if is_running:
-                self.progress_label.setText("Running...")
+                self.progress_label.setText("実行中...")
             else:
-                self.progress_label.setText("Idle")
+                self.progress_label.setText("待機中")
                 self.progress_bar.setRange(0, 1)
                 self.progress_bar.setValue(0)
             self._process_events()
 
         def _on_progress(self, phase_name: str, step_name: str, index: int, total: int) -> None:
-            self.progress_label.setText("{0}: {1}".format(phase_name, step_name))
+            self.progress_label.setText(JapaneseUiText.progress_label(phase_name, step_name))
             self.progress_bar.setRange(0, max(1, total))
             self.progress_bar.setValue(index)
             self._process_events()
@@ -3880,7 +4738,8 @@ if QtWidgets is not None:
                 color = "#9c6500"
             elif levelno >= logging.INFO:
                 color = "#0a4b78"
-            self.log_view.append('<span style="color:{0};">{1}</span>'.format(color, html.escape(message)))
+            localized_message = JapaneseUiText.translate(message)
+            self.log_view.append('<span style="color:{0};">{1}</span>'.format(color, html.escape(localized_message)))
             self._process_events()
 
         def _set_status(self, status: str, message: str) -> None:
@@ -3891,7 +4750,7 @@ if QtWidgets is not None:
                 "error": ("#fdecea", "#b00020"),
             }
             background, foreground = palette.get(status, ("#f0f0f0", "#333333"))
-            self.status_label.setText(message)
+            self.status_label.setText(JapaneseUiText.translate(message))
             self.status_label.setStyleSheet(
                 "padding: 6px; border: 1px solid {0}; background: {1}; color: {0};".format(
                     foreground, background
@@ -3934,25 +4793,20 @@ if QtWidgets is not None:
                 aligned_cameras = self.pipeline.aligner.aligned_camera_count(chunk)
 
             backend_manager = self.pipeline.blur_evaluator.backend_manager
-            backend_report: Dict[str, Any] = dict(backend_manager.detect_cuda_support())
-            if self.config.opencv_backend_report_path.exists():
-                try:
-                    with self.config.opencv_backend_report_path.open("r", encoding="utf-8") as handle:
-                        saved_backend_report = json.load(handle)
-                    if isinstance(saved_backend_report, Mapping):
-                        backend_report.update(saved_backend_report)
-                except Exception as exc:
-                    self._append_log_entry(
-                        logging.WARNING,
-                        "Failed to read backend report: {0}".format(exc),
-                    )
-            has_runtime_backend = bool(backend_manager._backend_ensured)
-            current_backend = (
-                str(backend_report.get("active_backend", "cpu"))
-                if has_runtime_backend
-                else self._preview_opencv_backend(backend_report)
+            gpu_reports = self.pipeline.gpu_status.collect_all(
+                backend_manager,
+                self.pipeline.mask_generator,
+                save=False,
             )
-            fallback_detected = "yes" if backend_report.get("fallback_events") else "no"
+            backend_report = self._merge_saved_report(self.config.opencv_backend_report_path, gpu_reports["opencv"])
+            yolo_report = self._merge_saved_report(self.config.yolo_backend_report_path, gpu_reports["yolo"])
+            metashape_report = self._merge_saved_report(
+                self.config.metashape_gpu_report_path,
+                gpu_reports["metashape"],
+            )
+            gpu_summary = self.pipeline.gpu_status.build_summary(backend_report, yolo_report, metashape_report)
+            if not backend_manager._backend_ensured:
+                gpu_summary["opencv_status"] = self._preview_opencv_backend(backend_report)
 
             summary_values = {
                 "selected_pairs": selected_pairs,
@@ -3963,10 +4817,19 @@ if QtWidgets is not None:
                 "overlap_rows": overlap_rows,
                 "enabled_cameras": enabled_cameras,
                 "aligned_cameras": aligned_cameras,
-                "opencv_backend": current_backend,
-                "cuda_device_count": backend_report.get("cuda_device_count", 0),
-                "cuda_fallback": fallback_detected,
-                "backend_report_path": str(self.config.opencv_backend_report_path),
+                "opencv_status": gpu_summary["opencv_status"],
+                "yolo_status": gpu_summary["yolo_status"],
+                "metashape_gpu_status": gpu_summary["metashape_gpu_status"],
+                "gpu_fallback": gpu_summary["gpu_fallback"],
+                "device_indices": gpu_summary["device_indices"],
+                "backend_report_paths": ", ".join(
+                    (
+                        str(self.config.opencv_backend_report_path),
+                        str(self.config.yolo_backend_report_path),
+                        str(self.config.metashape_gpu_report_path),
+                        str(self.config.gpu_summary_report_path),
+                    )
+                ),
             }
             for key, value in summary_values.items():
                 self._summary_labels[key].setText(str(value))
@@ -3987,16 +4850,29 @@ if QtWidgets is not None:
             device_count = int(backend_report.get("cuda_device_count", 0) or 0)
             cuda_ready = bool(backend_report.get("cuda_api_available")) and device_count > self.config.cuda_device_index
             if self.config.opencv_backend == "cpu":
-                return "cpu"
+                return "OpenCV: CPU 実行"
             if self.config.opencv_backend == "cuda":
                 if cuda_ready:
-                    return "cuda"
+                    return "OpenCV: CUDA 使用中"
                 if self.config.cuda_allow_fallback:
-                    return "cpu (fallback)"
-                return "cuda unavailable"
+                    return "OpenCV: CPU フォールバック"
+                return "OpenCV: CUDA 利用不可"
             if self.config.prefer_cuda and cuda_ready:
-                return "cuda"
-            return "cpu"
+                return "OpenCV: CUDA 使用中"
+            return "OpenCV: CPU 実行"
+
+        def _merge_saved_report(self, path: Path, current_report: Mapping[str, Any]) -> Dict[str, Any]:
+            merged_report = dict(current_report)
+            if not path.exists():
+                return merged_report
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    saved_report = json.load(handle)
+                if isinstance(saved_report, Mapping):
+                    merged_report.update(saved_report)
+            except Exception as exc:
+                self._append_log_entry(logging.WARNING, "backend report の読込に失敗しました: {0}".format(exc))
+            return merged_report
 
         @staticmethod
         def _count_csv_rows(path: Path) -> int:
@@ -4013,7 +4889,7 @@ if QtWidgets is not None:
             try:
                 return float(text)
             except ValueError as exc:
-                raise PipelineError("FFT blur threshold must be blank or numeric.") from exc
+                raise PipelineError("FFTブレ閾値は空欄または数値で入力してください。") from exc
 
         @staticmethod
         def _parse_vector(value: str) -> Tuple[float, float, float]:
@@ -4021,11 +4897,11 @@ if QtWidgets is not None:
                 return 0.0, 0.0, 0.0
             parts = [item.strip() for item in value.split(",") if item.strip()]
             if len(parts) != 3:
-                raise PipelineError("Rig vectors must contain exactly 3 comma-separated numbers.")
+                raise PipelineError("rigベクトルはカンマ区切りの3要素で入力してください。")
             try:
                 return float(parts[0]), float(parts[1]), float(parts[2])
             except ValueError as exc:
-                raise PipelineError("Rig vectors must contain numeric values.") from exc
+                raise PipelineError("rigベクトルには数値を入力してください。") from exc
 
         @staticmethod
         def _process_events() -> None:
@@ -4043,15 +4919,15 @@ else:
             del config
             del parent
             raise PipelineError(
-                "Qt bindings are not available in this Python runtime. "
-                "Use the existing menu actions and validate the current Metashape Qt binding."
+                "この Python 実行環境では Qt バインディングが利用できません。"
+                "既存メニューを使用し、現在の Metashape Qt バインディングを確認してください。"
             )
 
 
 def _show_result(result: PhaseResult) -> None:
     """Display a compact phase summary."""
 
-    message = "[{0}] {1}".format(result.status.upper(), result.message)
+    message = "[{0}] {1}".format(result.status.upper(), JapaneseUiText.translate(result.message))
     LOGGER.info(message)
     if Metashape is not None:
         Metashape.app.messageBox(message)
@@ -4148,15 +5024,15 @@ def register_menu_items() -> None:
         return
 
     menu_items = (
-        ("00 Open GUI", menu_open_gui),
-        ("01 Run Full Pipeline", menu_run_full_pipeline),
-        ("02 Extract Streams", menu_extract_streams),
-        ("03 Select Frames", menu_select_frames),
-        ("04 Generate Masks", menu_generate_masks),
-        ("05 Import to Metashape", menu_import_to_metashape),
-        ("06 Align", menu_align),
-        ("07 Reduce Overlap", menu_reduce_overlap),
-        ("08 Export Logs", menu_export_logs),
+        ("00 GUIを開く", menu_open_gui),
+        ("01 フルパイプライン実行", menu_run_full_pipeline),
+        ("02 ストリーム抽出", menu_extract_streams),
+        ("03 フレーム選別", menu_select_frames),
+        ("04 マスク生成", menu_generate_masks),
+        ("05 Metashapeへ読込", menu_import_to_metashape),
+        ("06 アライメント", menu_align),
+        ("07 冗長画像削減", menu_reduce_overlap),
+        ("08 ログ出力", menu_export_logs),
     )
     pipeline = get_pipeline()
     for suffix, callback in menu_items:

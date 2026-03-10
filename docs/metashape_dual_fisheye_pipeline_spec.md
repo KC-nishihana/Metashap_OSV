@@ -131,14 +131,15 @@ project_root/
 
 Metashape 起動後に以下メニューを追加する。
 
-- `Custom/DualFisheye/01 Run Full Pipeline`
-- `Custom/DualFisheye/02 Extract Streams`
-- `Custom/DualFisheye/03 Select Frames`
-- `Custom/DualFisheye/04 Generate Masks`
-- `Custom/DualFisheye/05 Import to Metashape`
-- `Custom/DualFisheye/06 Align`
-- `Custom/DualFisheye/07 Reduce Overlap`
-- `Custom/DualFisheye/08 Export Logs`
+- `Custom/DualFisheye/00 GUIを開く`
+- `Custom/DualFisheye/01 フルパイプライン実行`
+- `Custom/DualFisheye/02 ストリーム抽出`
+- `Custom/DualFisheye/03 フレーム選別`
+- `Custom/DualFisheye/04 マスク生成`
+- `Custom/DualFisheye/05 Metashapeへ読込`
+- `Custom/DualFisheye/06 アライメント`
+- `Custom/DualFisheye/07 冗長画像削減`
+- `Custom/DualFisheye/08 ログ出力`
 
 ### 5.1 推奨方針
 
@@ -167,6 +168,16 @@ CONFIG = {
     "mask_model": "yolo",
     "mask_classes": ["person", "car", "truck", "bus", "motorbike"],
     "mask_dilate_px": 8,
+    "opencv_backend": "auto",
+    "prefer_cuda": True,
+    "cuda_device_index": 0,
+    "cuda_allow_fallback": True,
+    "cuda_log_device_info": True,
+    "yolo_device_mode": "auto",
+    "prefer_yolo_cuda": True,
+    "yolo_allow_fallback": True,
+    "yolo_device_index": 0,
+    "save_backend_report": True,
     "metashape_image_quality_threshold": 0.5,
     "match_downscale": 1,
     "keypoint_limit": 40000,
@@ -586,17 +597,21 @@ def run_full_pipeline(config):
 - back stream index
 - ブレ閾値
 - YOLOモデルパス
+- OpenCV 実行方式
+- YOLO 実行方式
 - Metashape 品質閾値
 - 近接距離閾値
 - 回転差閾値
 
 GUI / 設定ファイルの入力要件:
 
-- `Input OSV` は未選択状態を許容し、固定ダミーパスを初期値にしない
+- `入力OSV` は未選択状態を許容し、固定ダミーパスを初期値にしない
 - Browse または手入力で設定した `.osv` は、実行前だけでなく GUI 内部 config にも同期する
 - stale config に旧 `.mp4` が残っていても GUI 起動は継続し、invalid 状態として警告表示する
 - If probe results disagree with the configured stream indices, the GUI must surface a clear warning or error message.
 - If the `.osv` contains three or more video streams, the GUI must continue when the configured front/back indices are valid.
+- GUI のユーザー向け文言は日本語を優先し、OpenCV / YOLO / Metashape GPU 状態を個別表示する
+- `save_backend_report=True` の場合は `opencv_backend_report.json`、`yolo_backend_report.json`、`metashape_gpu_report.json`、`gpu_summary_report.json` を出力する
 
 ### 将来拡張
 
