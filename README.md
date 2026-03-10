@@ -27,7 +27,7 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - `OverlapReducer` for post-alignment redundancy filtering using distance + rotation thresholds with station-level pair preservation
 - `LogWriter` for CSV / JSON phase outputs
 - `ConfigPersistence`, `GuiLogHandler`, and `PipelineController` as the GUI-facing orchestration layer
-- menu registration for:
+- explicit plugin initialization via `initialize_plugin()` and idempotent menu registration for:
   - `Custom/DualFisheye/00 GUIを開く`
   - `Custom/DualFisheye/01 フルパイプライン実行`
   - `Custom/DualFisheye/02 ストリーム抽出`
@@ -46,6 +46,7 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - binary mask PNG output under:
   - `work/selected/masks/front/`
   - `work/selected/masks/back/`
+  - saved as binary `uint8` PNG with `target_black` polarity: target/excluded objects = `0`, valid area = `255`
 - `frame_quality.csv`, `mask_summary.csv`, `metashape_quality.csv`, and `overlap_reduction.csv` output under `work/logs/`
 - `opencv_backend_report.json`, `yolo_backend_report.json`, `metashape_gpu_report.json`, and `gpu_summary_report.json` output under `work/logs/` when `save_backend_report=True`
 - `cuda_fallback.log` output under `work/logs/` when a CUDA selection or runtime fallback occurs
@@ -53,6 +54,8 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - camera-level mask assignment via `Metashape.Mask()` + `mask.load()` + `camera.mask = mask`
 - reset-aware re-execution hooks for `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
 - Unicode-safe OpenCV image IO for non-ASCII project paths on macOS and Windows
+- import-time side effects reduced so plain `import` defines classes/functions without auto-registering menus, probing GPU state, or creating GUI objects
+- GUI / menu / backend status initialization moved to lazy execution paths such as `initialize_plugin()`, GUI open, run actions, and explicit status refresh
 
 ## Current Limitations
 
@@ -108,6 +111,7 @@ Default mask-related configuration in `PipelineConfig`:
 - `mask_model_path = "yolo11n-seg.pt"`
 - `mask_classes = ("person", "car", "truck", "bus", "motorbike")`
 - `mask_dilate_px = 8`
+- `mask_polarity = "target_black"`
 - `mask_confidence_threshold = 0.25`
 - `mask_iou_threshold = 0.45`
 
@@ -130,6 +134,8 @@ Default OpenCV backend configuration in `PipelineConfig`:
 
 1. Open Metashape Professional.
 2. Run `scripts/metashape_dual_fisheye_pipeline.py` from the Metashape Python console or scripts menu.
+   - script execution calls `initialize_plugin()` and registers the menu tree
+   - if you `import metashape_dual_fisheye_pipeline` manually, call `initialize_plugin()` yourself when you want menus
 3. Open `Custom/DualFisheye/00 GUIを開く` and select the input `.osv` container first.
 4. Confirm the selected `.osv` contains at least two usable video streams, and set `front_stream_index` / `back_stream_index` to the two streams to extract.
 5. Use one of these menu entries:
@@ -158,18 +164,23 @@ Tabs:
 The GUI supports:
 
 - Browse buttons for input OSV, work folder, and YOLO model path
+- dialog sizing that clamps the initial window to the available screen area on startup
+- per-tab vertical scrolling so smaller notebook screens can reach every control without widening the dialog
+- long path fields that stay inside the dialog width and expose the full path through widget tooltips
 - bare `mask_model_path` values such as `yolo26x-seg.pt` are resolved locally in this order:
   - absolute path from the current GUI field or loaded config
   - project-root relative path
   - work-root relative path
 - if the YOLO model file is not found locally, the GUI warns before inference and does not rely on automatic download retries
 - OpenCV / YOLO / Metashape GPU status are displayed separately in the summary tab
+- GPU status probes are lazy: the dialog starts from saved reports / preview values, and `状態更新` or phase execution refreshes live runtime status
 - OpenCV and YOLO can fall back independently; the summary tab also shows the aggregated fallback flag
 - `front_stream_index` / `back_stream_index` values persisted into `PipelineConfig` and used by `probe_streams()`
 - per-phase execution and full-pipeline execution
 - colored log messages for info, warning, and error output
 - status and step progress updates during execution
 - `設定保存`, `設定読込`, and `初期値に戻す`
+- the `ログ / 状態` tab keeps detailed status in the same constrained window; scroll vertically when the summary is longer than the visible area
 - start-time validation for strict `opencv_backend="cuda"` runs when `cuda_allow_fallback=False`
 - start-time validation for strict `yolo_device_mode="cuda"` runs when `yolo_allow_fallback=False`
 
@@ -210,6 +221,7 @@ Relationship to the existing menu flow:
 5. `Generate Masks` writes binary PNG masks to:
    - `work/selected/masks/front/F_*.png`
    - `work/selected/masks/back/B_*.png`
+   - detected targets such as people or vehicles are saved as black `0`; valid area is white `255`
 6. `Generate Masks` writes `work/logs/mask_summary.csv`
 7. `Import to Metashape` imports selected front/back pairs using `Metashape.MultiplaneLayout`
 8. All imported sensors are set to `Metashape.Sensor.Type.Fisheye`
@@ -305,6 +317,18 @@ CUDA-capable runtime:
 2. If the current Metashape build exposes GPU inspection fields, confirm the report records available keys such as `gpu_mask`, `cpu_enable`, or enumerated GPU devices.
 3. If the current build does not expose stable GPU inspection fields, confirm the GUI summary shows `Metashape GPU: 未確認` and `metashape_gpu_report.json` includes explicit `TODO` notes instead of guessed state.
 4. Confirm `work/logs/gpu_summary_report.json` keeps OpenCV / YOLO / Metashape status in separate fields and records the aggregated fallback flag.
+
+### Shutdown / Crash Triage
+
+- For Metashape exit-crash triage, compare two cases on the same build and dataset:
+  - Metashape without loading this script
+  - Metashape after loading this script but before running any phase
+- The current design keeps plain module import as lightweight as possible:
+  - no automatic menu registration on import
+  - no GUI creation on import
+  - no OpenCV / YOLO / Metashape GPU probe on import
+  - no file / stream logger duplication on repeated initialization
+- Menu registration, GUI creation, and backend probing are now lazy and should happen only during explicit plugin initialization, GUI open, run actions, or `状態更新`.
 
 ### macOS Development Notes
 

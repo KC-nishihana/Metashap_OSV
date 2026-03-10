@@ -168,6 +168,7 @@ CONFIG = {
     "mask_model": "yolo",
     "mask_classes": ["person", "car", "truck", "bus", "motorbike"],
     "mask_dilate_px": 8,
+    "mask_polarity": "target_black",
     "opencv_backend": "auto",
     "prefer_cuda": True,
     "cuda_device_index": 0,
@@ -355,8 +356,10 @@ class BlurEvaluator:
 ### 実装方針
 
 - 初期版は YOLO ベースで人物・車両等を除外対象とする
-- マスクは白黒 PNG とする
-- 必要に応じて二値化後に dilation を適用
+- マスクは二値 PNG（`uint8` の `0 / 255`）とする
+- 検出対象（人物・車両など）は黒 `0`、それ以外は白 `255` とする
+- 必要に応じて二値化後に dilation を適用し、最終保存前に必ず `黒=除外対象 / 白=有効領域` へ正規化する
+- 設定値 `mask_polarity` の既定値は `"target_black"` とする
 - 将来拡張で SAM 系との併用を許容
 
 ### 関数仕様

@@ -78,9 +78,60 @@ for _qt_binding, _qt_modules in (
 LOGGER = logging.getLogger("dual_fisheye_pipeline")
 _MENU_REGISTERED = False
 _GUI_DIALOG = None
+_APP_SHUTDOWN_CONNECTED = False
 _PIPELINE_SCRIPT_NAME = "metashape_dual_fisheye_pipeline.py"
 _INPUT_OSV_SUFFIX = ".osv"
 _INPUT_OSV_PLACEHOLDER = "OSV未選択"
+_MENU_ROOT = "Custom/DualFisheye"
+_LOGGER_HANDLER_MARKER = "_dual_fisheye_handler"
+_LOGGER_HANDLER_ID_ATTR = "_dual_fisheye_handler_id"
+_LOGGER_FILE_HANDLER_ID = "file"
+_LOGGER_STREAM_HANDLER_ID = "stream"
+_LOGGER_GUI_HANDLER_ID = "gui"
+
+
+def _append_unique_message(messages: List[str], message: str) -> None:
+    """Append a message once while preserving order."""
+
+    if message not in messages:
+        messages.append(message)
+
+
+def _mark_logger_handler(handler: logging.Handler, handler_id: str) -> logging.Handler:
+    """Tag handlers created by this module so they can be cleaned up safely."""
+
+    setattr(handler, _LOGGER_HANDLER_MARKER, True)
+    setattr(handler, _LOGGER_HANDLER_ID_ATTR, handler_id)
+    return handler
+
+
+def _is_managed_logger_handler(handler: logging.Handler, handler_id: Optional[str] = None) -> bool:
+    """Return True when the handler belongs to this module."""
+
+    if not getattr(handler, _LOGGER_HANDLER_MARKER, False):
+        return False
+    if handler_id is None:
+        return True
+    return getattr(handler, _LOGGER_HANDLER_ID_ATTR, "") == handler_id
+
+
+def shutdown_logging(include_gui_handlers: bool = True) -> None:
+    """Remove and close logger handlers created by this module."""
+
+    removable_ids = {_LOGGER_FILE_HANDLER_ID, _LOGGER_STREAM_HANDLER_ID}
+    if include_gui_handlers:
+        removable_ids.add(_LOGGER_GUI_HANDLER_ID)
+
+    for handler in list(LOGGER.handlers):
+        if not _is_managed_logger_handler(handler):
+            continue
+        if getattr(handler, _LOGGER_HANDLER_ID_ATTR, "") not in removable_ids:
+            continue
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
 
 def _default_project_root() -> Path:
@@ -301,7 +352,7 @@ class PipelineConfig:
     input_mp4: Optional[Path] = field(default_factory=_default_input_mp4)
     work_root: Path = field(default_factory=_default_work_root)
     project_path: Path = field(default_factory=_default_project_path)
-    menu_root: str = "Custom/DualFisheye"
+    menu_root: str = _MENU_ROOT
     chunk_name: str = "Dual Fisheye"
     front_stream_index: int = 0
     back_stream_index: int = 1
@@ -316,6 +367,7 @@ class PipelineConfig:
     mask_model_path: str = "yolo26x-seg.pt"
     mask_classes: Tuple[str, ...] = ("person", "car", "truck", "bus", "motorbike")
     mask_dilate_px: int = 8
+    mask_polarity: str = "target_black"
     mask_confidence_threshold: float = 0.25
     mask_iou_threshold: float = 0.45
     mask_device: Optional[str] = None
@@ -471,6 +523,8 @@ class PipelineConfig:
             raise ValueError("mask_classes must not be empty.")
         if self.mask_dilate_px < 0:
             raise ValueError("mask_dilate_px must be >= 0.")
+        if self.mask_polarity != "target_black":
+            raise ValueError("mask_polarity must remain 'target_black' for the current implementation.")
         if not 0.0 <= self.mask_confidence_threshold <= 1.0:
             raise ValueError("mask_confidence_threshold must be between 0 and 1.")
         if not 0.0 <= self.mask_iou_threshold <= 1.0:
@@ -939,11 +993,12 @@ class GpuStatusAggregator:
         opencv_manager: "OpenCVBackendManager",
         mask_generator: "MaskGenerator",
         save: Optional[bool] = None,
+        probe_runtime: bool = True,
     ) -> Dict[str, Any]:
         should_save = self.config.save_backend_report if save is None else save
-        opencv_report = dict(opencv_manager.build_backend_report())
-        yolo_report = dict(mask_generator.build_backend_report())
-        metashape_report = self.collect_metashape_report()
+        opencv_report = dict(opencv_manager.build_backend_report(probe_runtime=probe_runtime))
+        yolo_report = dict(mask_generator.build_backend_report(probe_runtime=probe_runtime))
+        metashape_report = self.collect_metashape_report(probe_runtime=probe_runtime)
         summary_report = self.build_summary(opencv_report, yolo_report, metashape_report)
         if should_save:
             self.logs.write_json(self.config.opencv_backend_report_path, opencv_report)
@@ -987,11 +1042,18 @@ class GpuStatusAggregator:
             },
         }
 
-    def collect_metashape_report(self) -> Dict[str, Any]:
+    def collect_metashape_report(self, probe_runtime: bool = True) -> Dict[str, Any]:
         report = MetashapeGpuReport(
             metashape_available=Metashape is not None,
             app_available=bool(getattr(Metashape, "app", None)) if Metashape is not None else False,
         )
+        if not probe_runtime:
+            report.status = "deferred"
+            _append_unique_message(
+                report.notes,
+                "Metashape GPU probe is deferred until explicit status refresh or pipeline execution.",
+            )
+            return report.to_dict()
         if Metashape is None:
             report.warnings.append("Metashape runtime is not available in this Python environment.")
             return report.to_dict()
@@ -1206,10 +1268,20 @@ class OpenCVBackendManager:
         if self.config.cuda_log_device_info:
             self._log_device_info(device_index)
 
-    def build_backend_report(self) -> Dict[str, Any]:
+    def build_backend_report(self, probe_runtime: bool = True) -> Dict[str, Any]:
         """Return a serializable backend report with current fallback state."""
 
-        self.detect_cuda_support()
+        if probe_runtime:
+            self.detect_cuda_support()
+        elif not self._report_cached:
+            _append_unique_message(
+                self._report.notes,
+                "OpenCV CUDA probe is deferred until explicit status refresh or pipeline execution.",
+            )
+            self._report.requested_backend = self.config.opencv_backend
+            self._report.prefer_cuda = self.config.prefer_cuda
+            self._report.cuda_allow_fallback = self.config.cuda_allow_fallback
+            self._report.cuda_device_index = self.config.cuda_device_index
         self._report.active_backend = self.active_backend
         self._report.selected_backend = self._report.selected_backend or self.active_backend
         self._report.active_device_index = self.active_device_index
@@ -1284,6 +1356,15 @@ class OpenCVBackendManager:
     @property
     def fallback_detected(self) -> bool:
         return bool(self._report.fallback_events)
+
+    def cleanup(self) -> None:
+        """Drop cached runtime state so GUI teardown does not retain backend objects."""
+
+        self.active_backend = "cpu"
+        self.active_device_index = None
+        self._backend_ensured = False
+        self._report = CudaCapabilityReport()
+        self._report_cached = False
 
     def _cuda_unavailable_reason(self, config: PipelineConfig, report: CudaCapabilityReport) -> str:
         if not report.cv2_available or not report.numpy_available:
@@ -1438,23 +1519,37 @@ def configure_logging(config: PipelineConfig) -> None:
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     file_path = str(config.error_log_path.resolve())
     has_file_handler = False
-
-    for handler in LOGGER.handlers:
+    for handler in list(LOGGER.handlers):
+        if not _is_managed_logger_handler(handler, _LOGGER_FILE_HANDLER_ID):
+            continue
         if isinstance(handler, logging.FileHandler) and handler.baseFilename == file_path:
             has_file_handler = True
-            break
+            continue
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
     if not has_file_handler:
-        handler = logging.FileHandler(file_path, encoding="utf-8")
+        handler = _mark_logger_handler(logging.FileHandler(file_path, encoding="utf-8"), _LOGGER_FILE_HANDLER_ID)
         handler.setFormatter(formatter)
         LOGGER.addHandler(handler)
 
-    has_stream_handler = any(
-        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
-        for handler in LOGGER.handlers
-    )
+    has_stream_handler = False
+    for handler in list(LOGGER.handlers):
+        if not _is_managed_logger_handler(handler, _LOGGER_STREAM_HANDLER_ID):
+            continue
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            has_stream_handler = True
+            continue
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
     if not has_stream_handler:
-        stream_handler = logging.StreamHandler()
+        stream_handler = _mark_logger_handler(logging.StreamHandler(), _LOGGER_STREAM_HANDLER_ID)
         stream_handler.setFormatter(formatter)
         LOGGER.addHandler(stream_handler)
 
@@ -1547,6 +1642,7 @@ class GuiLogHandler(logging.Handler):
         super().__init__(level=logging.INFO)
         self.callback = callback
         self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        _mark_logger_handler(self, _LOGGER_GUI_HANDLER_ID)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -2563,7 +2659,7 @@ class MaskGenerator:
         """Persist a binary PNG mask to disk."""
 
         self._require_cv_runtime()
-        mask_to_save = np.where(mask > 0, 255, 0).astype(np.uint8)
+        mask_to_save = self._normalize_mask_for_save(mask)
         _write_image_with_unicode_path(out_path, mask_to_save)
 
     def process_image(
@@ -2588,6 +2684,7 @@ class MaskGenerator:
             "target_classes": ",".join(result["target_classes"]),
             "masked_pixels": result["masked_pixels"],
             "dilate_px": self.config.mask_dilate_px,
+            "mask_polarity": self.config.mask_polarity,
         }
 
     def run(self) -> PhaseResult:
@@ -2623,6 +2720,7 @@ class MaskGenerator:
                 "target_classes",
                 "masked_pixels",
                 "dilate_px",
+                "mask_polarity",
             ),
         )
         self.save_backend_report()
@@ -2640,10 +2738,21 @@ class MaskGenerator:
             },
         )
 
-    def build_backend_report(self) -> Dict[str, Any]:
+    def build_backend_report(self, probe_runtime: bool = True) -> Dict[str, Any]:
         """Return a serializable YOLO backend report with current fallback state."""
 
-        self.detect_backend_support()
+        if probe_runtime:
+            self.detect_backend_support()
+        elif not self._report_cached:
+            _append_unique_message(
+                self._report.notes,
+                "YOLO device probe is deferred until explicit status refresh or pipeline execution.",
+            )
+            self._report.requested_mode = self.config.yolo_device_mode
+            self._report.prefer_cuda = self.config.prefer_yolo_cuda
+            self._report.allow_fallback = self.config.yolo_allow_fallback
+            self._report.device_index = self.config.yolo_device_index
+            self._report.local_model_path = str(self.config.find_local_mask_model_path() or "")
         self._report.selected_device = self._report.selected_device or self._active_device
         self._report.active_device = self._active_device
         if self._resolved_model_path is not None:
@@ -2689,6 +2798,21 @@ class MaskGenerator:
         self.record_fallback(reason, context=context, image_path=image_path)
         self._set_active_device("cpu")
         self.save_backend_report()
+
+    def cleanup(self) -> None:
+        """Release model references and cached device state on GUI shutdown."""
+
+        self._model = None
+        self._resolved_model_path = None
+        self._active_device = "cpu"
+        self._report = YoloBackendReport()
+        self._report_cached = False
+        cuda_api = getattr(torch, "cuda", None) if torch is not None else None
+        if cuda_api is not None and hasattr(cuda_api, "empty_cache"):
+            try:
+                cuda_api.empty_cache()
+            except Exception:
+                pass
 
     def _set_active_device(self, device: str) -> None:
         self._active_device = device
@@ -2778,20 +2902,32 @@ class MaskGenerator:
             mask_array = mask_array.cpu()
         if hasattr(mask_array, "numpy"):
             mask_array = mask_array.numpy()
-        mask_array = np.where(mask_array > 0.5, 255, 0).astype(np.uint8)
+        mask_array = MaskGenerator._normalize_binary_mask(mask_array > 0.5)
         if mask_array.shape != shape:
             mask_array = cv2.resize(mask_array, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_array = MaskGenerator._normalize_binary_mask(mask_array)
         return mask_array
 
     @staticmethod
     def _mask_result(mask: Any, detection_count: int, target_classes: Sequence[str]) -> Dict[str, Any]:
+        normalized_mask = MaskGenerator._normalize_binary_mask(mask)
         unique_classes = sorted(set(class_name for class_name in target_classes if class_name))
         return {
-            "mask": np.where(mask > 0, 255, 0).astype(np.uint8),
+            "mask": normalized_mask,
             "detection_count": detection_count,
             "target_classes": unique_classes,
-            "masked_pixels": int(np.count_nonzero(mask)),
+            "masked_pixels": int(np.count_nonzero(normalized_mask)),
         }
+
+    @staticmethod
+    def _normalize_binary_mask(mask: Any) -> Any:
+        return np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+
+    def _normalize_mask_for_save(self, mask: Any) -> Any:
+        normalized_mask = self._normalize_binary_mask(mask)
+        if self.config.mask_polarity == "target_black":
+            return np.where(normalized_mask > 0, 0, 255).astype(np.uint8)
+        return normalized_mask
 
     @staticmethod
     def _require_cv_runtime() -> None:
@@ -2875,7 +3011,7 @@ class MetashapeImporter:
             if not mask_path.exists():
                 missing_labels.append(camera_label)
                 continue
-            # TODO: re-check camera.mask assignment on the current Metashape build with a small sample.
+            # TODO: re-check camera.mask assignment and target_black PNG polarity on the current Metashape build with a small sample.
             mask = Metashape.Mask()
             mask.load(str(mask_path))
             camera.mask = mask
@@ -3675,7 +3811,11 @@ class PipelineController:
     def run_export_logs(self) -> PhaseResult:
         return self._run_phase(self._run_export_logs_impl, "export_logs")
 
-    def build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    def build_log_summary(
+        self,
+        extra: Optional[Mapping[str, Any]] = None,
+        probe_backends: bool = True,
+    ) -> Dict[str, Any]:
         """Build a compact summary of config, logs, and the active chunk."""
 
         required_logs = {
@@ -3703,7 +3843,8 @@ class PipelineController:
         gpu_reports = self.gpu_status.collect_all(
             self.blur_evaluator.backend_manager,
             self.mask_generator,
-            save=self.config.save_backend_report,
+            save=self.config.save_backend_report if probe_backends else False,
+            probe_runtime=probe_backends,
         )
         summary: Dict[str, Any] = {
             "config": self.config.to_dict(),
@@ -3726,6 +3867,13 @@ class PipelineController:
         if extra:
             summary.update(extra)
         return summary
+
+    def cleanup(self) -> None:
+        """Release GUI-owned backend state and close managed log handlers."""
+
+        self.blur_evaluator.backend_manager.cleanup()
+        self.mask_generator.cleanup()
+        self._logging_configured = False
 
     def _run_extract_streams_impl(self) -> PhaseResult:
         input_path = self.config.require_input_video()
@@ -4055,8 +4203,15 @@ class DualFisheyePipeline:
     def run_export_logs(self) -> PhaseResult:
         return self.controller.run_export_logs()
 
-    def build_log_summary(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        return self.controller.build_log_summary(extra)
+    def build_log_summary(
+        self,
+        extra: Optional[Mapping[str, Any]] = None,
+        probe_backends: bool = True,
+    ) -> Dict[str, Any]:
+        return self.controller.build_log_summary(extra, probe_backends=probe_backends)
+
+    def cleanup(self) -> None:
+        self.controller.cleanup()
 
 
 if QtWidgets is not None:
@@ -4072,6 +4227,7 @@ if QtWidgets is not None:
             self._action_buttons: List[Any] = []
             self._widgets: Dict[str, Any] = {}
             self._summary_labels: Dict[str, Any] = {}
+            self._cleaned_up = False
             self._gui_log_handler = GuiLogHandler(self._append_log_entry)
             LOGGER.addHandler(self._gui_log_handler)
             self._build_ui()
@@ -4079,21 +4235,40 @@ if QtWidgets is not None:
             loaded_previous = self._load_last_used_config_if_available()
             if not loaded_previous:
                 self._refresh_input_osv_field_state()
-            self.refresh_summary()
+            self.refresh_summary(probe_backends=False)
 
         def closeEvent(self, event: Any) -> None:
-            self._save_last_used_config(silent=True)
-            try:
-                LOGGER.removeHandler(self._gui_log_handler)
-            except ValueError:
-                pass
+            self.cleanup()
+            _release_gui_dialog(self)
             super().closeEvent(event)
+
+        def cleanup(self) -> None:
+            """Release GUI-owned references so Metashape shutdown sees less live state."""
+
+            if self._cleaned_up:
+                return
+            self._cleaned_up = True
+            self._save_last_used_config(silent=True)
+            if self._gui_log_handler is not None:
+                try:
+                    LOGGER.removeHandler(self._gui_log_handler)
+                except ValueError:
+                    pass
+                try:
+                    self._gui_log_handler.close()
+                except Exception:
+                    pass
+                self._gui_log_handler = None
+            if self.pipeline is not None:
+                self.pipeline.cleanup()
 
         def _build_ui(self) -> None:
             self.setWindowTitle("デュアル魚眼パイプライン")
-            self.resize(980, 760)
+            self.setMinimumSize(560, 480)
 
             root_layout = QtWidgets.QVBoxLayout(self)
+            root_layout.setContentsMargins(10, 10, 10, 10)
+            root_layout.setSpacing(8)
 
             config_button_row = QtWidgets.QHBoxLayout()
             save_button = QtWidgets.QPushButton("設定保存")
@@ -4111,10 +4286,12 @@ if QtWidgets is not None:
             self._action_buttons.extend([save_button, load_button, reset_button])
 
             self.status_label = QtWidgets.QLabel("準備完了")
+            self.status_label.setWordWrap(True)
             self.status_label.setStyleSheet("padding: 6px; border: 1px solid #bcbcbc;")
             root_layout.addWidget(self.status_label)
 
             self.progress_label = QtWidgets.QLabel("待機中")
+            self.progress_label.setWordWrap(True)
             root_layout.addWidget(self.progress_label)
 
             self.progress_bar = QtWidgets.QProgressBar()
@@ -4122,20 +4299,24 @@ if QtWidgets is not None:
             self.progress_bar.setValue(0)
             root_layout.addWidget(self.progress_bar)
 
-            tabs = QtWidgets.QTabWidget()
-            tabs.addTab(self._build_basic_tab(), "基本設定")
-            tabs.addTab(self._build_preprocess_tab(), "前処理")
-            tabs.addTab(self._build_mask_import_tab(), "マスク / 読込")
-            tabs.addTab(self._build_align_tab(), "アライメント / 間引き")
-            tabs.addTab(self._build_logs_tab(), "ログ / 状態")
-            root_layout.addWidget(tabs)
+            self.tabs = QtWidgets.QTabWidget()
+            self.tabs.addTab(self._build_basic_tab(), "基本設定")
+            self.tabs.addTab(self._build_preprocess_tab(), "前処理")
+            self.tabs.addTab(self._build_mask_import_tab(), "マスク / 読込")
+            self.tabs.addTab(self._build_align_tab(), "アライメント / 間引き")
+            self.tabs.addTab(self._build_logs_tab(), "ログ / 状態")
+            root_layout.addWidget(self.tabs, 1)
+            self._configure_dialog_geometry()
 
         def _build_basic_tab(self) -> Any:
-            tab = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(tab)
-            form = QtWidgets.QFormLayout()
+            content = self._create_tab_container()
+            layout = QtWidgets.QVBoxLayout(content)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
 
-            form.addRow(
+            path_group, path_layout = self._create_group_box("入力 / 作業フォルダ")
+            path_form = self._create_form_layout()
+            path_form.addRow(
                 "入力OSV",
                 self._build_path_field(
                     "input_mp4",
@@ -4145,191 +4326,224 @@ if QtWidgets is not None:
                     placeholder=_INPUT_OSV_PLACEHOLDER,
                 ),
             )
-            form.addRow("作業フォルダ", self._build_path_field("work_root", directory=True))
-            form.addRow("前方ストリーム番号", self._register_widget("front_stream_index", self._spin_box(0, 99)))
-            form.addRow("後方ストリーム番号", self._register_widget("back_stream_index", self._spin_box(0, 99)))
+            path_form.addRow("作業フォルダ", self._build_path_field("work_root", directory=True))
+            path_layout.addLayout(path_form)
+            layout.addWidget(path_group)
 
-            layout.addLayout(form)
+            stream_group, stream_layout = self._create_group_box("ストリーム設定")
+            stream_form = self._create_form_layout()
+            stream_form.addRow("前方ストリーム番号", self._register_widget("front_stream_index", self._spin_box(0, 99)))
+            stream_form.addRow("後方ストリーム番号", self._register_widget("back_stream_index", self._spin_box(0, 99)))
+            stream_layout.addLayout(stream_form)
+            layout.addWidget(stream_group)
 
             run_button = QtWidgets.QPushButton("フル実行")
             run_button.clicked.connect(lambda: self._run_action("run_full_pipeline", self.pipeline.run_full_pipeline))
             self._action_buttons.append(run_button)
-            layout.addWidget(run_button)
+            layout.addWidget(self._create_action_group("実行", (run_button,), columns=1))
             layout.addStretch(1)
-            return tab
+            return self._wrap_scrollable_tab(content)
 
         def _build_preprocess_tab(self) -> Any:
-            tab = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(tab)
-            form = QtWidgets.QFormLayout()
+            content = self._create_tab_container()
+            layout = QtWidgets.QVBoxLayout(content)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
 
-            form.addRow(
+            extraction_group, extraction_layout = self._create_group_box("抽出 / ブレ判定")
+            extraction_form = self._create_form_layout()
+            extraction_form.addRow(
                 "何フレームごとに抽出",
                 self._register_widget("extract_every_n_frames", self._spin_box(1, 10000)),
             )
-            form.addRow(
+            extraction_form.addRow(
                 "前方ブレ閾値",
                 self._register_widget("blur_threshold_front", self._double_spin_box(0.0, 100000.0, 4)),
             )
-            form.addRow(
+            extraction_form.addRow(
                 "後方ブレ閾値",
                 self._register_widget("blur_threshold_back", self._double_spin_box(0.0, 100000.0, 4)),
             )
-            form.addRow("FFTブレ閾値", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
-            form.addRow("JPEG品質", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
-            form.addRow(
+            extraction_form.addRow("FFTブレ閾値", self._register_widget("fft_blur_threshold", QtWidgets.QLineEdit()))
+            extraction_form.addRow("JPEG品質", self._register_widget("jpeg_quality", self._spin_box(1, 31)))
+            extraction_layout.addLayout(extraction_form)
+            layout.addWidget(extraction_group)
+
+            opencv_group, opencv_layout = self._create_group_box("OpenCV / CUDA")
+            opencv_form = self._create_form_layout()
+            opencv_form.addRow(
                 "OpenCV実行方式",
                 self._register_widget("opencv_backend", self._combo_box(("auto", "cpu", "cuda"))),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CUDAを優先",
-                self._register_widget("prefer_cuda", QtWidgets.QCheckBox("auto 選択時に CUDA を優先する")),
+                self._register_widget("prefer_cuda", QtWidgets.QCheckBox("有効にする")),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CUDAデバイス番号",
                 self._register_widget("cuda_device_index", self._spin_box(0, 31)),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CPUフォールバックを許可",
-                self._register_widget("cuda_allow_fallback", QtWidgets.QCheckBox("CUDA 失敗時に CPU へ切り替える")),
+                self._register_widget("cuda_allow_fallback", QtWidgets.QCheckBox("許可する")),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CUDAデバイス情報を記録",
-                self._register_widget("cuda_log_device_info", QtWidgets.QCheckBox("選択したデバイス情報をログに出力する")),
+                self._register_widget("cuda_log_device_info", QtWidgets.QCheckBox("記録する")),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CUDAガウシアン事前ぼかし",
                 self._register_widget(
                     "cuda_use_gaussian_preblur",
-                    QtWidgets.QCheckBox("Laplacian 前に任意の CUDA ガウシアンぼかしを適用する"),
+                    QtWidgets.QCheckBox("有効にする"),
                 ),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "CUDAベンチマークモード",
-                self._register_widget("cuda_benchmark_mode", QtWidgets.QCheckBox("画像ごとの処理時間を記録する")),
+                self._register_widget("cuda_benchmark_mode", QtWidgets.QCheckBox("記録する")),
             )
-            form.addRow(
+            opencv_form.addRow(
                 "backend report を保存",
-                self._register_widget("save_backend_report", QtWidgets.QCheckBox("GPU 状態レポート JSON を保存する")),
+                self._register_widget("save_backend_report", QtWidgets.QCheckBox("保存する")),
             )
+            opencv_layout.addLayout(opencv_form)
+            layout.addWidget(opencv_group)
 
-            layout.addLayout(form)
-
-            button_row = QtWidgets.QHBoxLayout()
             extract_button = QtWidgets.QPushButton("ストリーム抽出")
             extract_button.clicked.connect(lambda: self._run_action("extract_streams", self.pipeline.run_extract_streams))
             select_button = QtWidgets.QPushButton("フレーム選別")
             select_button.clicked.connect(lambda: self._run_action("select_frames", self.pipeline.run_select_frames))
-            button_row.addWidget(extract_button)
-            button_row.addWidget(select_button)
-            button_row.addStretch(1)
-            layout.addLayout(button_row)
+            layout.addWidget(self._create_action_group("前処理実行", (extract_button, select_button), columns=2))
             self._action_buttons.extend([extract_button, select_button])
             layout.addStretch(1)
-            return tab
+            return self._wrap_scrollable_tab(content)
 
         def _build_mask_import_tab(self) -> Any:
-            tab = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(tab)
-            form = QtWidgets.QFormLayout()
+            content = self._create_tab_container()
+            layout = QtWidgets.QVBoxLayout(content)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
 
-            form.addRow("YOLOモデルパス", self._build_path_field("mask_model_path", directory=False))
-            form.addRow("マスク対象クラス", self._register_widget("mask_classes", QtWidgets.QLineEdit()))
-            form.addRow("マスク膨張ピクセル", self._register_widget("mask_dilate_px", self._spin_box(0, 1024)))
-            form.addRow(
+            mask_group, mask_layout = self._create_group_box("モデル / マスク")
+            mask_form = self._create_form_layout()
+            mask_form.addRow("YOLOモデルパス", self._build_path_field("mask_model_path", directory=False))
+            mask_form.addRow("マスク対象クラス", self._register_widget("mask_classes", QtWidgets.QLineEdit()))
+            mask_form.addRow("マスク膨張ピクセル", self._register_widget("mask_dilate_px", self._spin_box(0, 1024)))
+            mask_form.addRow(
+                "マスク極性",
+                self._register_widget("mask_polarity", self._combo_box(("target_black",))),
+            )
+            mask_layout.addLayout(mask_form)
+            layout.addWidget(mask_group)
+
+            yolo_group, yolo_layout = self._create_group_box("YOLO / デバイス")
+            yolo_form = self._create_form_layout()
+            yolo_form.addRow(
                 "YOLO実行方式",
                 self._register_widget("yolo_device_mode", self._combo_box(("auto", "cpu", "cuda"))),
             )
-            form.addRow(
+            yolo_form.addRow(
                 "YOLOでCUDAを優先",
-                self._register_widget("prefer_yolo_cuda", QtWidgets.QCheckBox("auto 選択時に CUDA を優先する")),
+                self._register_widget("prefer_yolo_cuda", QtWidgets.QCheckBox("有効にする")),
             )
-            form.addRow(
+            yolo_form.addRow(
                 "YOLO CPUフォールバックを許可",
-                self._register_widget("yolo_allow_fallback", QtWidgets.QCheckBox("CUDA 失敗時に CPU へ切り替える")),
+                self._register_widget("yolo_allow_fallback", QtWidgets.QCheckBox("許可する")),
             )
-            form.addRow(
+            yolo_form.addRow(
                 "YOLOデバイス番号",
                 self._register_widget("yolo_device_index", self._spin_box(0, 31)),
             )
+            yolo_layout.addLayout(yolo_form)
+            layout.addWidget(yolo_group)
 
-            layout.addLayout(form)
-
-            button_row = QtWidgets.QHBoxLayout()
             mask_button = QtWidgets.QPushButton("マスク生成")
             mask_button.clicked.connect(lambda: self._run_action("generate_masks", self.pipeline.run_generate_masks))
             import_button = QtWidgets.QPushButton("Metashapeへ読込")
             import_button.clicked.connect(
                 lambda: self._run_action("import_to_metashape", self.pipeline.run_import_to_metashape)
             )
-            button_row.addWidget(mask_button)
-            button_row.addWidget(import_button)
-            button_row.addStretch(1)
-            layout.addLayout(button_row)
+            layout.addWidget(self._create_action_group("マスク / 読込 実行", (mask_button, import_button), columns=2))
             self._action_buttons.extend([mask_button, import_button])
             layout.addStretch(1)
-            return tab
+            return self._wrap_scrollable_tab(content)
 
         def _build_align_tab(self) -> Any:
-            tab = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(tab)
-            form = QtWidgets.QFormLayout()
+            content = self._create_tab_container()
+            layout = QtWidgets.QVBoxLayout(content)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
 
-            form.addRow(
+            align_group, align_layout = self._create_group_box("アライメント / 間引き")
+            align_form = self._create_form_layout()
+            align_form.addRow(
                 "画質閾値",
                 self._register_widget(
                     "metashape_image_quality_threshold",
                     self._double_spin_box(0.0, 1.0, 3, single_step=0.05),
                 ),
             )
-            form.addRow("キーポイント上限", self._register_widget("keypoint_limit", self._spin_box(1, 10000000)))
-            form.addRow("タイポイント上限", self._register_widget("tiepoint_limit", self._spin_box(1, 10000000)))
-            form.addRow(
+            align_form.addRow("キーポイント上限", self._register_widget("keypoint_limit", self._spin_box(1, 10000000)))
+            align_form.addRow("タイポイント上限", self._register_widget("tiepoint_limit", self._spin_box(1, 10000000)))
+            align_form.addRow(
                 "カメラ距離閾値",
                 self._register_widget("camera_distance_threshold", self._double_spin_box(0.0, 1000.0, 4)),
             )
-            form.addRow(
+            align_form.addRow(
                 "カメラ角度閾値（度）",
                 self._register_widget("camera_angle_threshold_deg", self._double_spin_box(0.0, 180.0, 4)),
             )
-            form.addRow("重複目標枚数", self._register_widget("overlap_target", self._spin_box(1, 99)))
-            form.addRow(
+            align_form.addRow("重複目標枚数", self._register_widget("overlap_target", self._spin_box(1, 99)))
+            align_layout.addLayout(align_form)
+            layout.addWidget(align_group)
+
+            rig_group, rig_layout = self._create_group_box("rig参照")
+            rig_form = self._create_form_layout()
+            rig_form.addRow(
                 "rig参照を有効化",
-                self._register_widget("enable_rig_reference", QtWidgets.QCheckBox("rig 参照を使用する")),
+                self._register_widget("enable_rig_reference", QtWidgets.QCheckBox("有効にする")),
             )
-            form.addRow(
+            rig_location = self._register_widget("rig_relative_location", QtWidgets.QLineEdit())
+            rig_location.setPlaceholderText("0.0, 0.0, 0.0")
+            rig_form.addRow(
                 "rig相対位置",
-                self._register_widget("rig_relative_location", QtWidgets.QLineEdit()),
+                rig_location,
             )
-            form.addRow(
+            rig_rotation = self._register_widget("rig_relative_rotation", QtWidgets.QLineEdit())
+            rig_rotation.setPlaceholderText("0.0, 0.0, 0.0")
+            rig_form.addRow(
                 "rig相対回転",
-                self._register_widget("rig_relative_rotation", QtWidgets.QLineEdit()),
+                rig_rotation,
             )
+            rig_layout.addLayout(rig_form)
+            layout.addWidget(rig_group)
 
-            layout.addLayout(form)
-
-            button_row = QtWidgets.QHBoxLayout()
             align_button = QtWidgets.QPushButton("アライメント")
             align_button.clicked.connect(lambda: self._run_action("align", self.pipeline.run_align))
             reduce_button = QtWidgets.QPushButton("冗長画像削減")
             reduce_button.clicked.connect(lambda: self._run_action("reduce_overlap", self.pipeline.run_reduce_overlap))
             export_button = QtWidgets.QPushButton("ログ出力")
             export_button.clicked.connect(lambda: self._run_action("export_logs", self.pipeline.run_export_logs))
-            button_row.addWidget(align_button)
-            button_row.addWidget(reduce_button)
-            button_row.addWidget(export_button)
-            button_row.addStretch(1)
-            layout.addLayout(button_row)
+            layout.addWidget(
+                self._create_action_group(
+                    "アライメント関連実行",
+                    (align_button, reduce_button, export_button),
+                    columns=2,
+                )
+            )
             self._action_buttons.extend([align_button, reduce_button, export_button])
             layout.addStretch(1)
-            return tab
+            return self._wrap_scrollable_tab(content)
 
         def _build_logs_tab(self) -> Any:
-            tab = QtWidgets.QWidget()
-            layout = QtWidgets.QVBoxLayout(tab)
+            content = self._create_tab_container()
+            layout = QtWidgets.QVBoxLayout(content)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
 
             summary_group = QtWidgets.QGroupBox("集計 / GPU状態")
-            summary_form = QtWidgets.QFormLayout(summary_group)
+            summary_layout = QtWidgets.QVBoxLayout(summary_group)
+            summary_form = self._create_form_layout()
             for key, label in (
                 ("selected_pairs", "採用ペア数"),
                 ("discarded_pairs", "除外ペア数"),
@@ -4347,18 +4561,29 @@ if QtWidgets is not None:
                 ("backend_report_paths", "backend report 保存先"),
             ):
                 value_label = QtWidgets.QLabel("-")
+                value_label.setWordWrap(True)
                 self._summary_labels[key] = value_label
                 summary_form.addRow(label, value_label)
+            summary_layout.addLayout(summary_form)
             layout.addWidget(summary_group)
 
+            refresh_button = QtWidgets.QPushButton("状態更新")
+            refresh_button.clicked.connect(lambda: self.refresh_summary(probe_backends=True))
+            self._action_buttons.append(refresh_button)
+            layout.addWidget(refresh_button)
+
+            detail_group, detail_layout = self._create_group_box("詳細")
             self.summary_text = QtWidgets.QPlainTextEdit()
             self.summary_text.setReadOnly(True)
-            layout.addWidget(self.summary_text, 1)
+            self.summary_text.setMinimumHeight(150)
+            detail_layout.addWidget(self.summary_text, 1)
 
             self.log_view = QtWidgets.QTextEdit()
             self.log_view.setReadOnly(True)
-            layout.addWidget(self.log_view, 2)
-            return tab
+            self.log_view.setMinimumHeight(220)
+            detail_layout.addWidget(self.log_view, 2)
+            layout.addWidget(detail_group, 1)
+            return self._wrap_scrollable_tab(content)
 
         def _build_path_field(
             self,
@@ -4372,8 +4597,12 @@ if QtWidgets is not None:
             row = QtWidgets.QHBoxLayout(container)
             row.setContentsMargins(0, 0, 0, 0)
             line_edit = QtWidgets.QLineEdit()
+            line_edit.setMinimumWidth(0)
             if placeholder:
                 line_edit.setPlaceholderText(placeholder)
+            line_edit.textChanged.connect(
+                lambda value, widget=line_edit: self._update_path_widget_tooltip(widget, value)
+            )
             line_edit.editingFinished.connect(
                 lambda name=name, widget=line_edit: self._sync_path_field_value(name, widget.text())
             )
@@ -4381,9 +4610,121 @@ if QtWidgets is not None:
             browse_button.clicked.connect(lambda: self._browse_path(name, directory, dialog_title, file_filter))
             row.addWidget(line_edit, 1)
             row.addWidget(browse_button)
+            self._update_path_widget_tooltip(line_edit, "")
             self._widgets[name] = line_edit
             self._action_buttons.append(browse_button)
             return container
+
+        @staticmethod
+        def _qt_enum(owner: Any, *paths: str) -> Any:
+            for path in paths:
+                value = owner
+                missing = False
+                for part in path.split("."):
+                    value = getattr(value, part, None)
+                    if value is None:
+                        missing = True
+                        break
+                if not missing:
+                    return value
+            raise AttributeError("Qt enum path not available: {0}".format(", ".join(paths)))
+
+        def _create_tab_container(self) -> Any:
+            return QtWidgets.QWidget()
+
+        def _create_group_box(self, title: str) -> Tuple[Any, Any]:
+            group = QtWidgets.QGroupBox(title)
+            layout = QtWidgets.QVBoxLayout(group)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(8)
+            return group, layout
+
+        def _create_form_layout(self) -> Any:
+            form = QtWidgets.QFormLayout()
+            try:
+                form.setFieldGrowthPolicy(
+                    self._qt_enum(
+                        QtWidgets.QFormLayout,
+                        "AllNonFixedFieldsGrow",
+                        "FieldGrowthPolicy.AllNonFixedFieldsGrow",
+                    )
+                )
+            except AttributeError:
+                pass
+            try:
+                form.setRowWrapPolicy(
+                    self._qt_enum(
+                        QtWidgets.QFormLayout,
+                        "WrapLongRows",
+                        "RowWrapPolicy.WrapLongRows",
+                    )
+                )
+            except AttributeError:
+                pass
+            return form
+
+        def _create_action_group(self, title: str, buttons: Sequence[Any], columns: int = 2) -> Any:
+            group, layout = self._create_group_box(title)
+            grid = QtWidgets.QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(8)
+            for index, button in enumerate(buttons):
+                grid.addWidget(button, index // columns, index % columns)
+            layout.addLayout(grid)
+            return group
+
+        def _wrap_scrollable_tab(self, content: Any) -> Any:
+            scroll_area = QtWidgets.QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setWidget(content)
+            return scroll_area
+
+        def _configure_dialog_geometry(self) -> None:
+            geometry = self._available_screen_geometry()
+            if geometry is None:
+                self.resize(820, 720)
+                return
+
+            max_width = min(geometry.width(), max(360, int(geometry.width() * 0.88)))
+            max_height = min(geometry.height(), max(320, int(geometry.height() * 0.88)))
+            min_width = min(max_width, 560)
+            min_height = min(max_height, 480)
+            self.setMinimumSize(min_width, min_height)
+            self.setMaximumSize(max_width, max_height)
+            self.adjustSize()
+            width = min(max(self.sizeHint().width(), min_width), max_width)
+            height = min(max(self.sizeHint().height(), min_height), max_height)
+            self.resize(width, height)
+            self.move(
+                geometry.x() + max(0, int((geometry.width() - width) / 2)),
+                geometry.y() + max(0, int((geometry.height() - height) / 2)),
+            )
+
+        @staticmethod
+        def _available_screen_geometry() -> Optional[Any]:
+            app = QtWidgets.QApplication.instance()
+            if app is None:
+                return None
+            screen = None
+            if hasattr(app, "primaryScreen"):
+                screen = app.primaryScreen()
+            if screen is not None and hasattr(screen, "availableGeometry"):
+                return screen.availableGeometry()
+            desktop = app.desktop() if hasattr(app, "desktop") else None
+            if desktop is not None and hasattr(desktop, "availableGeometry"):
+                return desktop.availableGeometry()
+            return None
+
+        @staticmethod
+        def _update_path_widget_tooltip(widget: Any, value: str, detail: Optional[str] = None) -> None:
+            messages: List[str] = []
+            text = value.strip()
+            if text:
+                messages.append(text)
+            if detail:
+                messages.append(detail)
+            widget.setToolTip("\n".join(messages))
 
         def _register_widget(self, name: str, widget: Any) -> Any:
             self._widgets[name] = widget
@@ -4482,6 +4823,7 @@ if QtWidgets is not None:
             self._widgets["save_backend_report"].setChecked(config.save_backend_report)
             self._widgets["mask_classes"].setText(", ".join(config.mask_classes))
             self._widgets["mask_dilate_px"].setValue(config.mask_dilate_px)
+            self._widgets["mask_polarity"].setCurrentText(config.mask_polarity)
             self._widgets["metashape_image_quality_threshold"].setValue(config.metashape_image_quality_threshold)
             self._widgets["keypoint_limit"].setValue(config.keypoint_limit)
             self._widgets["tiepoint_limit"].setValue(config.tiepoint_limit)
@@ -4514,7 +4856,7 @@ if QtWidgets is not None:
             elif name == "work_root" and announce:
                 self._set_status("info", "作業フォルダを変更しました。保存または実行すると設定パスが反映されます。")
             if name in ("input_mp4", "work_root"):
-                self.refresh_summary()
+                self.refresh_summary(probe_backends=False)
 
         def _sync_config_from_widgets(self) -> None:
             config = PipelineConfig.from_mapping(self.config.to_dict())
@@ -4544,6 +4886,7 @@ if QtWidgets is not None:
                     "mask_model_path": self._widgets["mask_model_path"].text().strip(),
                     "mask_classes": self._widgets["mask_classes"].text().strip(),
                     "mask_dilate_px": self._widgets["mask_dilate_px"].value(),
+                    "mask_polarity": self._widgets["mask_polarity"].currentText(),
                     "metashape_image_quality_threshold": self._widgets[
                         "metashape_image_quality_threshold"
                     ].value(),
@@ -4569,13 +4912,13 @@ if QtWidgets is not None:
             issue = self.config.input_video_validation_error(require_exists=True)
             if issue is None:
                 input_widget.setStyleSheet("")
-                input_widget.setToolTip("ffprobe / ffmpeg に渡せる OSV コンテナです。")
+                self._update_path_widget_tooltip(input_widget, input_widget.text(), "ffprobe / ffmpeg に渡せる OSV コンテナです。")
                 if status_prefix:
                     self._set_status("ok", status_prefix)
                 return
 
             input_widget.setStyleSheet("border: 1px solid #c98900; background: #fff8e1;")
-            input_widget.setToolTip(str(issue))
+            self._update_path_widget_tooltip(input_widget, input_widget.text(), str(issue))
             if status_prefix:
                 self._set_status("warning", "{0} {1}".format(status_prefix, issue))
             elif not input_widget.text().strip():
@@ -4590,17 +4933,19 @@ if QtWidgets is not None:
             if issue is None:
                 resolved_path = self.config.find_local_mask_model_path()
                 model_widget.setStyleSheet("")
-                model_widget.setToolTip(
+                self._update_path_widget_tooltip(
+                    model_widget,
+                    model_widget.text(),
                     "ローカル YOLO モデルを利用できます: {0}".format(
                         resolved_path if resolved_path is not None else ""
-                    )
+                    ),
                 )
                 if status_prefix:
                     self._set_status("ok", status_prefix)
                 return
 
             model_widget.setStyleSheet("border: 1px solid #c98900; background: #fff8e1;")
-            model_widget.setToolTip(str(issue))
+            self._update_path_widget_tooltip(model_widget, model_widget.text(), str(issue))
             if status_prefix:
                 self._set_status("warning", "{0} {1}".format(status_prefix, issue))
 
@@ -4671,7 +5016,7 @@ if QtWidgets is not None:
                 self.config = loaded
                 self.pipeline = self._build_pipeline(self.config)
                 self._populate_widgets_from_config(self.config)
-                self.refresh_summary()
+                self.refresh_summary(probe_backends=False)
                 issues = self._config_issue_messages()
                 status = "ok" if not issues else "warning"
                 message = "設定を読み込みました: {0}".format(selected_path)
@@ -4685,7 +5030,7 @@ if QtWidgets is not None:
             self.config = PipelineConfig()
             self.pipeline = self._build_pipeline(self.config)
             self._populate_widgets_from_config(self.config)
-            self.refresh_summary()
+            self.refresh_summary(probe_backends=False)
             self._refresh_input_osv_field_state("GUIの設定値を初期値に戻しました。")
 
         def _run_action(self, action_name: str, runner: Callable[[], PhaseResult]) -> None:
@@ -4706,7 +5051,7 @@ if QtWidgets is not None:
                     self._set_status("warning", result.message)
                 else:
                     self._set_status("ok", result.message)
-                self.refresh_summary()
+                self.refresh_summary(probe_backends=True)
             except Exception as exc:
                 LOGGER.exception("GUI action '%s' failed: %s", action_name, exc)
                 self._set_status("error", str(exc))
@@ -4758,7 +5103,7 @@ if QtWidgets is not None:
             )
             self._process_events()
 
-        def refresh_summary(self) -> None:
+        def refresh_summary(self, probe_backends: bool = False) -> None:
             selected_pairs = 0
             discarded_pairs = 0
             if self.config.frame_quality_log_path.exists():
@@ -4797,6 +5142,7 @@ if QtWidgets is not None:
                 backend_manager,
                 self.pipeline.mask_generator,
                 save=False,
+                probe_runtime=probe_backends,
             )
             backend_report = self._merge_saved_report(self.config.opencv_backend_report_path, gpu_reports["opencv"])
             yolo_report = self._merge_saved_report(self.config.yolo_backend_report_path, gpu_reports["yolo"])
@@ -4805,7 +5151,7 @@ if QtWidgets is not None:
                 gpu_reports["metashape"],
             )
             gpu_summary = self.pipeline.gpu_status.build_summary(backend_report, yolo_report, metashape_report)
-            if not backend_manager._backend_ensured:
+            if not probe_backends and not backend_manager._backend_ensured:
                 gpu_summary["opencv_status"] = self._preview_opencv_backend(backend_report)
 
             summary_values = {
@@ -4822,7 +5168,7 @@ if QtWidgets is not None:
                 "metashape_gpu_status": gpu_summary["metashape_gpu_status"],
                 "gpu_fallback": gpu_summary["gpu_fallback"],
                 "device_indices": gpu_summary["device_indices"],
-                "backend_report_paths": ", ".join(
+                "backend_report_paths": "\n".join(
                     (
                         str(self.config.opencv_backend_report_path),
                         str(self.config.yolo_backend_report_path),
@@ -4832,19 +5178,28 @@ if QtWidgets is not None:
                 ),
             }
             for key, value in summary_values.items():
-                self._summary_labels[key].setText(str(value))
+                text = str(value)
+                self._summary_labels[key].setText(text)
+                self._summary_labels[key].setToolTip(text)
 
-            summary_payload = self.pipeline.build_log_summary(extra={"gui_summary": summary_values})
+            summary_payload = self.pipeline.build_log_summary(
+                extra={"gui_summary": summary_values},
+                probe_backends=probe_backends,
+            )
             self.summary_text.setPlainText(json.dumps(summary_payload, indent=2, ensure_ascii=False))
             self._process_events()
 
         def _validate_preprocess_backend_action(self, action_name: str) -> None:
-            if action_name not in ("run_full_pipeline", "select_frames"):
-                return
             manager = self.pipeline.blur_evaluator.backend_manager
-            manager.detect_cuda_support()
-            if self.config.opencv_backend == "cuda" and not self.config.cuda_allow_fallback:
-                manager.select_backend(self.config)
+            if action_name in ("run_full_pipeline", "select_frames"):
+                manager.detect_cuda_support()
+                if self.config.opencv_backend == "cuda" and not self.config.cuda_allow_fallback:
+                    manager.select_backend(self.config)
+            if action_name in ("run_full_pipeline", "generate_masks"):
+                generator = self.pipeline.mask_generator
+                generator.detect_backend_support()
+                if self.config.yolo_device_mode == "cuda" and not self.config.yolo_allow_fallback:
+                    generator.resolve_device()
 
         def _preview_opencv_backend(self, backend_report: Mapping[str, Any]) -> str:
             device_count = int(backend_report.get("cuda_device_count", 0) or 0)
@@ -4944,10 +5299,95 @@ def get_pipeline(
     return DualFisheyePipeline(config=config, progress_callback=progress_callback)
 
 
+def _release_gui_dialog(dialog: Optional[Any] = None) -> None:
+    """Clear the global GUI reference once the dialog has been closed or discarded."""
+
+    global _GUI_DIALOG
+    if dialog is None or _GUI_DIALOG is dialog:
+        _GUI_DIALOG = None
+
+
+def cleanup_gui_dialog() -> None:
+    """Close and release the GUI dialog if it exists."""
+
+    global _GUI_DIALOG
+    dialog = _GUI_DIALOG
+    _GUI_DIALOG = None
+    if dialog is None:
+        return
+    if hasattr(dialog, "cleanup"):
+        try:
+            dialog.cleanup()
+        except Exception as exc:
+            LOGGER.warning("GUI cleanup raised an exception: %s", exc)
+    if hasattr(dialog, "close"):
+        try:
+            dialog.close()
+        except Exception:
+            pass
+    if hasattr(dialog, "deleteLater"):
+        try:
+            dialog.deleteLater()
+        except Exception:
+            pass
+
+
+def _menu_items() -> Tuple[Tuple[str, Callable[[], None]], ...]:
+    """Return the registered menu callbacks without constructing a pipeline."""
+
+    return (
+        ("00 GUIを開く", menu_open_gui),
+        ("01 フルパイプライン実行", menu_run_full_pipeline),
+        ("02 ストリーム抽出", menu_extract_streams),
+        ("03 フレーム選別", menu_select_frames),
+        ("04 マスク生成", menu_generate_masks),
+        ("05 Metashapeへ読込", menu_import_to_metashape),
+        ("06 アライメント", menu_align),
+        ("07 冗長画像削減", menu_reduce_overlap),
+        ("08 ログ出力", menu_export_logs),
+    )
+
+
+def _full_menu_label(suffix: str) -> str:
+    return "{0}/{1}".format(_MENU_ROOT, suffix)
+
+
+def register_application_shutdown() -> None:
+    """Connect plugin cleanup to the Qt application shutdown when available."""
+
+    global _APP_SHUTDOWN_CONNECTED
+    if _APP_SHUTDOWN_CONNECTED or QtWidgets is None:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is None or not hasattr(app, "aboutToQuit"):
+        return
+    try:
+        app.aboutToQuit.connect(shutdown_plugin)
+    except Exception:
+        return
+    _APP_SHUTDOWN_CONNECTED = True
+
+
+def unregister_application_shutdown() -> None:
+    """Disconnect the Qt shutdown hook when possible."""
+
+    global _APP_SHUTDOWN_CONNECTED
+    if not _APP_SHUTDOWN_CONNECTED or QtWidgets is None:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is not None and hasattr(app, "aboutToQuit"):
+        try:
+            app.aboutToQuit.disconnect(shutdown_plugin)
+        except Exception:
+            pass
+    _APP_SHUTDOWN_CONNECTED = False
+
+
 def menu_open_gui() -> None:
     """Menu callback for the Qt-based GUI launcher."""
 
     global _GUI_DIALOG
+    register_application_shutdown()
     if _GUI_DIALOG is not None and hasattr(_GUI_DIALOG, "isVisible") and _GUI_DIALOG.isVisible():
         _GUI_DIALOG.show()
         if hasattr(_GUI_DIALOG, "raise_"):
@@ -5022,24 +5462,55 @@ def register_menu_items() -> None:
     global _MENU_REGISTERED
     if Metashape is None or _MENU_REGISTERED:
         return
-
-    menu_items = (
-        ("00 GUIを開く", menu_open_gui),
-        ("01 フルパイプライン実行", menu_run_full_pipeline),
-        ("02 ストリーム抽出", menu_extract_streams),
-        ("03 フレーム選別", menu_select_frames),
-        ("04 マスク生成", menu_generate_masks),
-        ("05 Metashapeへ読込", menu_import_to_metashape),
-        ("06 アライメント", menu_align),
-        ("07 冗長画像削減", menu_reduce_overlap),
-        ("08 ログ出力", menu_export_logs),
-    )
-    pipeline = get_pipeline()
-    for suffix, callback in menu_items:
-        Metashape.app.addMenuItem("{0}/{1}".format(pipeline.config.menu_root, suffix), callback)
+    app = getattr(Metashape, "app", None)
+    if app is None:
+        return
+    remove_menu_item = getattr(app, "removeMenuItem", None)
+    for suffix, callback in _menu_items():
+        label = _full_menu_label(suffix)
+        if callable(remove_menu_item):
+            try:
+                remove_menu_item(label)
+            except Exception as exc:
+                LOGGER.warning("Failed to remove existing menu item '%s': %s", label, exc)
+        app.addMenuItem(label, callback)
     _MENU_REGISTERED = True
+    register_application_shutdown()
     LOGGER.info("Registered Dual Fisheye menu items.")
 
 
-if Metashape is not None:
+def unregister_menu_items() -> None:
+    """Remove the registered menu tree when the current runtime supports it."""
+
+    global _MENU_REGISTERED
+    if Metashape is None:
+        _MENU_REGISTERED = False
+        return
+    app = getattr(Metashape, "app", None)
+    remove_menu_item = getattr(app, "removeMenuItem", None) if app is not None else None
+    if callable(remove_menu_item):
+        for suffix, _callback in _menu_items():
+            label = _full_menu_label(suffix)
+            try:
+                remove_menu_item(label)
+            except Exception as exc:
+                LOGGER.warning("Failed to remove menu item '%s': %s", label, exc)
+    _MENU_REGISTERED = False
+
+
+def initialize_plugin() -> None:
+    """Explicit plugin entry point for Metashape script execution."""
+
     register_menu_items()
+
+
+def shutdown_plugin() -> None:
+    """Release GUI and logger state that can otherwise survive until application exit."""
+
+    cleanup_gui_dialog()
+    shutdown_logging(include_gui_handlers=True)
+    unregister_application_shutdown()
+
+
+if __name__ == "__main__":
+    initialize_plugin()

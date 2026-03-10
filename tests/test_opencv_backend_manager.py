@@ -10,13 +10,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "metashape_dual_fisheye_pipeline.py"
 
 
-def load_pipeline_module():
+def load_pipeline_module(metashape_module=None):
     spec = importlib.util.spec_from_file_location("metashape_dual_fisheye_pipeline", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     sys.modules[spec.name] = module
     previous_cv2 = sys.modules.get("cv2")
+    previous_metashape = sys.modules.get("Metashape")
     sys.modules["cv2"] = SimpleNamespace(__version__="stub")
+    if metashape_module is not None:
+        sys.modules["Metashape"] = metashape_module
     try:
         spec.loader.exec_module(module)
     finally:
@@ -24,6 +27,11 @@ def load_pipeline_module():
             sys.modules.pop("cv2", None)
         else:
             sys.modules["cv2"] = previous_cv2
+        if metashape_module is not None:
+            if previous_metashape is None:
+                sys.modules.pop("Metashape", None)
+            else:
+                sys.modules["Metashape"] = previous_metashape
     return module
 
 
@@ -67,6 +75,19 @@ class FakeCudaNamespace:
         return self._active_device
 
 
+class FakeMetashapeApp:
+    def __init__(self):
+        self.added = []
+        self.removed = []
+        self.document = SimpleNamespace(path="", chunk=None)
+
+    def addMenuItem(self, label, callback):
+        self.added.append((label, callback))
+
+    def removeMenuItem(self, label):
+        self.removed.append(label)
+
+
 def test_detect_cuda_support_handles_cpu_only_runtime(monkeypatch, tmp_path):
     module = load_pipeline_module()
     monkeypatch.setattr(module, "cv2", SimpleNamespace(__version__="4.13.0"), raising=False)
@@ -79,6 +100,30 @@ def test_detect_cuda_support_handles_cpu_only_runtime(monkeypatch, tmp_path):
     assert report["cv2_available"] is True
     assert report["cuda_namespace_available"] is False
     assert report["cuda_device_count"] == 0
+
+
+def test_import_does_not_register_menus_automatically():
+    fake_app = FakeMetashapeApp()
+    fake_metashape = SimpleNamespace(app=fake_app)
+
+    load_pipeline_module(metashape_module=fake_metashape)
+
+    assert fake_app.added == []
+    assert fake_app.removed == []
+
+
+def test_register_menu_items_is_idempotent():
+    fake_app = FakeMetashapeApp()
+    fake_metashape = SimpleNamespace(app=fake_app)
+    module = load_pipeline_module(metashape_module=fake_metashape)
+
+    module.register_menu_items()
+    module.register_menu_items()
+
+    labels = [label for label, _callback in fake_app.added]
+    assert len(labels) == 9
+    assert len(set(labels)) == 9
+    assert fake_app.removed == labels
 
 
 def test_select_backend_prefers_cuda_for_auto_when_available(monkeypatch, tmp_path):
@@ -231,3 +276,30 @@ def test_load_model_raises_clear_error_when_local_model_missing(monkeypatch, tmp
         generator.load_model()
 
     assert yolo_called["value"] is False
+
+
+def test_build_log_summary_can_skip_runtime_gpu_probes(monkeypatch, tmp_path):
+    module = load_pipeline_module()
+    config = make_config(module, tmp_path, save_backend_report=False)
+    controller = module.PipelineController(config, initialize_logging=False)
+
+    monkeypatch.setattr(
+        controller.blur_evaluator.backend_manager,
+        "detect_cuda_support",
+        lambda: (_ for _ in ()).throw(AssertionError("OpenCV probe should be deferred")),
+    )
+    monkeypatch.setattr(
+        controller.mask_generator,
+        "detect_backend_support",
+        lambda: (_ for _ in ()).throw(AssertionError("YOLO probe should be deferred")),
+    )
+
+    summary = controller.build_log_summary(probe_backends=False)
+
+    assert summary["opencv_backend"]["notes"] == [
+        "OpenCV CUDA probe is deferred until explicit status refresh or pipeline execution."
+    ]
+    assert summary["yolo_backend"]["notes"] == [
+        "YOLO device probe is deferred until explicit status refresh or pipeline execution."
+    ]
+    assert summary["metashape_gpu"]["status"] == "deferred"
