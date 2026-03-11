@@ -2120,7 +2120,9 @@ class BlurEvaluator:
             )
             gpu_working = self._apply_cuda_filter(gaussian_filter, gpu_working)
 
-        laplacian_filter = cuda_api.createLaplacianFilter(self._cv8uc1(), self._cv32fc1(), 3)
+        # Some OpenCV CUDA Python builds only accept matching source/destination types here.
+        gpu_working = self._convert_cuda_mat_type(gpu_working, self._cv32fc1())
+        laplacian_filter = cuda_api.createLaplacianFilter(self._cv32fc1(), self._cv32fc1(), 3)
         gpu_laplacian = self._apply_cuda_filter(laplacian_filter, gpu_working)
         mask = self.compute_center70_mask(image)
         laplacian = self._download_cuda_mat(gpu_laplacian)
@@ -2395,6 +2397,37 @@ class BlurEvaluator:
         if gpu_mat is None or not hasattr(gpu_mat, "download"):
             raise PipelineError("OpenCV CUDA did not return a downloadable GpuMat result.")
         return gpu_mat.download()
+
+    @staticmethod
+    def _convert_cuda_mat_type(gpu_mat: Any, cv_type: int) -> Any:
+        """Convert a CUDA mat type while tolerating Python binding signature differences."""
+
+        if gpu_mat is None or not hasattr(gpu_mat, "convertTo"):
+            raise PipelineError("OpenCV CUDA did not expose GpuMat.convertTo() for type conversion.")
+        try:
+            result = gpu_mat.convertTo(cv_type)
+            normalized_result = BlurEvaluator._normalize_cuda_result(result)
+            if normalized_result is not None:
+                return normalized_result
+        except TypeError:
+            pass
+        except Exception as exc:
+            raise PipelineError("OpenCV CUDA convertTo() failed: {0}".format(exc)) from exc
+
+        if getattr(cv2, "cuda", None) is None or not hasattr(cv2.cuda, "GpuMat"):
+            raise PipelineError("OpenCV CUDA convertTo() requires cv2.cuda.GpuMat in this build.")
+
+        gpu_destination = cv2.cuda.GpuMat()
+        for args in ((cv_type, gpu_destination), (cv_type, 1.0, 0.0, gpu_destination)):
+            try:
+                gpu_mat.convertTo(*args)
+                return gpu_destination
+            except TypeError:
+                continue
+            except Exception as exc:
+                raise PipelineError("OpenCV CUDA convertTo() failed: {0}".format(exc)) from exc
+
+        raise PipelineError("OpenCV CUDA convertTo() does not support the expected Python signatures.")
 
     @staticmethod
     def _apply_cuda_filter(cuda_filter: Any, gpu_source: Any) -> Any:

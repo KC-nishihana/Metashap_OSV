@@ -77,6 +77,7 @@ OpenCV CUDA notes for the current implementation:
 - `cuda` can fall back to CPU when `cuda_allow_fallback=True`; otherwise frame selection stops with an error
 - the keep rule remains unchanged: if either side passes, both images for that timestamp are kept
 - CUDA blur scoring currently targets single-image Laplacian evaluation only; batch optimization is still future work
+- the CUDA Laplacian path converts grayscale mats to `CV_32FC1` before filtering so builds that require matching source/destination types can stay on GPU
 - score differences between CPU and CUDA are expected because the CUDA path depends on the OpenCV CUDA Python bindings available in the current build
 - if the OpenCV build exposes only `cv2.cuda` core symbols without `createLaplacianFilter`, the pipeline records that in the backend report and stays on CPU
 

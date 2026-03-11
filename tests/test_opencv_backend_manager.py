@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -236,6 +237,68 @@ def test_apply_cuda_filter_accepts_direct_gpumat_return(monkeypatch, tmp_path):
     returned = module.BlurEvaluator._apply_cuda_filter(FakeFilter(gpu_result), FakeGpuMat(data="source"))
 
     assert returned is gpu_result
+
+
+def test_laplacian_score_cuda_converts_to_float32_before_filter(monkeypatch, tmp_path):
+    module = load_pipeline_module()
+
+    class FakeGpuMat:
+        def __init__(self, data=None):
+            self.data = data
+            self.convert_calls = []
+
+        def upload(self, data):
+            self.data = data
+
+        def download(self):
+            return self.data
+
+        def convertTo(self, cv_type):
+            self.convert_calls.append(cv_type)
+            return FakeGpuMat(self.data.astype(np.float32, copy=False))
+
+    class FakeFilter:
+        def __init__(self, result):
+            self.result = result
+
+        def apply(self, source):
+            return self.result
+
+    class FakeCudaNamespace:
+        def __init__(self):
+            self.last_uploaded = None
+            self.laplacian_args = None
+
+        def GpuMat(self):
+            gpu_mat = FakeGpuMat()
+            self.last_uploaded = gpu_mat
+            return gpu_mat
+
+        def createLaplacianFilter(self, src_type, dst_type, ksize):
+            self.laplacian_args = (src_type, dst_type, ksize)
+            return FakeFilter(FakeGpuMat(np.ones((4, 4), dtype=np.float32)))
+
+    fake_cuda = FakeCudaNamespace()
+    fake_cv2 = SimpleNamespace(
+        cuda=fake_cuda,
+        CV_8UC1=1,
+        CV_32FC1=2,
+        CV_8U=3,
+        CV_32F=4,
+    )
+    monkeypatch.setattr(module, "cv2", fake_cv2, raising=False)
+    monkeypatch.setattr(module, "np", np, raising=False)
+
+    config = make_config(module, tmp_path, opencv_backend="cuda", cuda_allow_fallback=False)
+    evaluator = module.BlurEvaluator(config, module.LogWriter())
+    monkeypatch.setattr(evaluator, "compute_center70_mask", lambda image: np.ones(image.shape[:2], dtype=np.uint8))
+
+    score = evaluator.laplacian_score_cuda(np.zeros((4, 4), dtype=np.uint8))
+
+    assert score == 0.0
+    assert fake_cuda.laplacian_args == (fake_cv2.CV_32FC1, fake_cv2.CV_32FC1, 3)
+    assert fake_cuda.last_uploaded is not None
+    assert fake_cuda.last_uploaded.convert_calls == [fake_cv2.CV_32FC1]
 
 
 def test_load_model_resolves_bare_filename_from_project_root(monkeypatch, tmp_path):
