@@ -56,6 +56,7 @@ The repository currently provides `scripts/metashape_dual_fisheye_pipeline.py` w
 - Unicode-safe OpenCV image IO for non-ASCII project paths on macOS and Windows
 - import-time side effects reduced so plain `import` defines classes/functions without auto-registering menus, probing GPU state, or creating GUI objects
 - GUI / menu / backend status initialization moved to lazy execution paths such as `initialize_plugin()`, GUI open, run actions, and explicit status refresh
+- terminal-launched Metashape Python runs now fall back to a standalone `Metashape.Document()` when `Metashape.app.document` is `None`, and reuse `project_path` for save/open across import, align, and overlap-reduction phases
 
 ## Current Limitations
 
@@ -63,7 +64,6 @@ Later phases still keep unvalidated API behavior behind explicit `TODO` markers:
 
 - `MultiplaneLayout` `filenames` / `filegroups` validation on the current Metashape build
 - `camera.mask` assignment re-check on the current Metashape build with a small sample
-- whether `alignCameras(reset_alignment=True)` needs additional current-build guards beyond the current implementation
 - whether `Chunk.reduceOverlap(...)` should remain optional or become part of the main workflow
 - optional rig reference handling
 - which Qt binding should be treated as the preferred Metashape GUI binding on the current build
@@ -137,6 +137,7 @@ Default OpenCV backend configuration in `PipelineConfig`:
 2. Run `scripts/metashape_dual_fisheye_pipeline.py` from the Metashape Python console or scripts menu.
    - script execution calls `initialize_plugin()` and registers the menu tree
    - if you `import metashape_dual_fisheye_pipeline` manually, call `initialize_plugin()` yourself when you want menus
+   - if you run phases from terminal-launched Metashape Python instead of the GUI app, the pipeline creates or reopens a standalone project document at the configured `project_path`
 3. Open `Custom/DualFisheye/00 GUIを開く` and select the input `.osv` container first.
 4. Confirm the selected `.osv` contains at least two usable video streams, and set `front_stream_index` / `back_stream_index` to the two streams to extract.
 5. Use one of these menu entries:
@@ -227,7 +228,8 @@ Relationship to the existing menu flow:
 7. `Import to Metashape` imports selected front/back pairs using `Metashape.MultiplaneLayout`
 8. All imported sensors are set to `Metashape.Sensor.Type.Fisheye`
 9. Matching mask PNGs are loaded from disk and assigned camera-by-camera
-10. `Align` runs `analyzeImages(filter_mask=True)`, keeps front/back pairs when either measured side meets `metashape_image_quality_threshold`, disables both sides only when all measured sides for the timestamp fall below threshold, writes `work/logs/metashape_quality.csv`, then calls `matchPhotos(...)` and `alignCameras(...)`
+10. `Align` runs `analyzeImages(filter_mask=True)`, keeps front/back pairs when either measured side meets `metashape_image_quality_threshold`, disables both sides only when all measured sides for the timestamp fall below threshold, writes `work/logs/metashape_quality.csv`, then calls `matchPhotos(reset_matches=True, mask_tiepoints=False, keep_keypoints=True, tiepoint_limit=4000)` and `alignCameras(reset_alignment=True)`
+   - align results now also summarize whether each slave sensor received an estimated relative rotation, so missing sleeve-offset estimation is visible in `pipeline_summary.json`
 11. `Reduce Overlap` compares adjacent aligned stations using both camera-center distance and rotation delta, disables the lower-priority redundant station pair, writes `work/logs/overlap_reduction.csv`, and can realign with `reset_matches=True` / `reset_alignment=True`
 12. `Export Logs` writes `work/logs/pipeline_summary.json` with current log presence and active chunk counts
 
@@ -260,6 +262,7 @@ For Phase 3 validation, then run `06 Align` and `07 Reduce Overlap` and confirm:
 - `work/logs/overlap_reduction.csv` is written even when no stations are disabled
 - if redundant stations are disabled, both sides of the losing timestamp are disabled together
 - rerunning overlap cleanup can trigger `matchPhotos(reset_matches=True, ...)` and `alignCameras(reset_alignment=True, ...)`
+- current Windows validation of the generated project confirmed that full-image alignment completed when `Reset current alignment` was enabled
 
 ### GUI Validation Checklist
 

@@ -79,10 +79,10 @@
 #### `chunk.sensors`
 - 用途: sensor 一覧アクセス
 
-#### `sensor.type = Metashape.Sensor.Type.Fisheye`
+#### `sensor.type = Metashape.Sensor.Type.EquisolidFisheye`
 - 用途: 魚眼センサー指定
 - チェック項目:
-  - [ ] front/back の全 sensor が Fisheye になっている
+  - [ ] front/back の全 sensor が EquisolidFisheye になっている
   - [ ] Spherical など別タイプになっていない
 
 #### `sensor.reference.location`
@@ -175,9 +175,11 @@
 #### `Chunk.alignCameras(...)`
 - 用途: カメラアライメント
 - チェック項目:
-  - [ ] 初回アライメントと再アライメントを分けて呼べる
-  - [ ] `reset_alignment=True` を再アライメント経路で使える構造にしている
+  - [x] 初回アライメントと再アライメントを分けて呼べる
+  - [x] `reset_alignment=True` を再アライメント経路で使える構造にしている
+  - [x] current build 実機検証で `Reset current alignment` 相当の `reset_alignment=True` が有効
   - [ ] アライメント後の有効 camera 数を確認している
+  - [ ] slave sensor の relative rotation が推定されたかを確認している
 
 ---
 
@@ -274,7 +276,7 @@
 - [ ] `camera.mask` 個別適用が問題なく動く
 - [ ] `analyzeImages(filter_mask=True)` 後に `Image/Quality` が取れる
 - [ ] `matchPhotos()` の現行引数名が現在の実行環境と一致する
-- [ ] `alignCameras(reset_alignment=True)` が現在の実行環境で通る
+- [x] `alignCameras(reset_alignment=True)` が現在の実行環境で通る
 
 ### 4.2 コード上で TODO 明示すべき項目
 - [ ] `filenames` / `filegroups` の最終構成ロジックを current build で確定

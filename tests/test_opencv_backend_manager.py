@@ -89,6 +89,30 @@ class FakeMetashapeApp:
         self.removed.append(label)
 
 
+class FakeHeadlessDocument:
+    def __init__(self):
+        self.path = ""
+        self.chunks = []
+        self.chunk = None
+        self.opened_path = None
+        self.saved_paths = []
+
+    def open(self, path):
+        self.path = path
+        self.opened_path = path
+
+    def save(self, path=None):
+        target_path = self.path if path is None else path
+        self.saved_paths.append(target_path)
+        self.path = target_path
+
+    def addChunk(self):
+        chunk = SimpleNamespace(label="", cameras=[], sensors=[])
+        self.chunks.append(chunk)
+        self.chunk = chunk
+        return chunk
+
+
 def test_detect_cuda_support_handles_cpu_only_runtime(monkeypatch, tmp_path):
     module = load_pipeline_module()
     monkeypatch.setattr(module, "cv2", SimpleNamespace(__version__="4.13.0"), raising=False)
@@ -125,6 +149,143 @@ def test_register_menu_items_is_idempotent():
     assert len(labels) == 9
     assert len(set(labels)) == 9
     assert fake_app.removed == labels
+
+
+def test_get_or_create_metashape_document_uses_headless_fallback(tmp_path):
+    fake_app = FakeMetashapeApp()
+    fake_app.document = None
+    created_documents = []
+
+    def fake_document_factory():
+        document = FakeHeadlessDocument()
+        created_documents.append(document)
+        return document
+
+    fake_metashape = SimpleNamespace(app=fake_app, Document=fake_document_factory)
+    module = load_pipeline_module(metashape_module=fake_metashape)
+    config = make_config(module, tmp_path)
+
+    document = module.get_or_create_metashape_document(config, create=True)
+    assert document is created_documents[0]
+
+    module.save_metashape_document(config)
+
+    assert document.saved_paths == [str(config.project_path)]
+    assert module.get_or_create_metashape_document(config, create=False) is document
+
+
+def test_align_cameras_resets_alignment_by_default(tmp_path):
+    module = load_pipeline_module()
+    config = make_config(module, tmp_path)
+    aligner = module.MetashapeAligner(config, module.LogWriter())
+
+    class FakeChunk:
+        def __init__(self):
+            self.calls = []
+
+        def alignCameras(self, **kwargs):
+            self.calls.append(kwargs)
+
+    chunk = FakeChunk()
+
+    aligner.align_cameras(chunk)
+
+    assert chunk.calls == [{"reset_alignment": True}]
+
+
+def test_match_photos_uses_manual_alignment_compatible_defaults(tmp_path):
+    module = load_pipeline_module()
+    config = make_config(module, tmp_path)
+    aligner = module.MetashapeAligner(config, module.LogWriter())
+
+    class FakeChunk:
+        def __init__(self):
+            self.calls = []
+
+        def matchPhotos(self, **kwargs):
+            self.calls.append(kwargs)
+
+    chunk = FakeChunk()
+
+    aligner.match_photos(chunk, config, reset_matches=True)
+
+    assert chunk.calls == [
+        {
+            "downscale": 1,
+            "generic_preselection": True,
+            "reference_preselection": False,
+            "filter_mask": True,
+            "mask_tiepoints": False,
+            "filter_stationary_points": True,
+            "keep_keypoints": True,
+            "keypoint_limit": 40000,
+            "tiepoint_limit": 4000,
+            "reset_matches": True,
+        }
+    ]
+
+
+def test_summarize_multicamera_sensor_offsets_reports_missing_slave_rotation():
+    module = load_pipeline_module()
+    master_sensor = SimpleNamespace(
+        key=0,
+        label="master",
+        master=None,
+        fixed_location=True,
+        fixed_rotation=True,
+        rotation=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        rotation_covariance=[[0.0, 0.0, 0.0]],
+    )
+    master_sensor.master = master_sensor
+    slave_sensor = SimpleNamespace(
+        key=1,
+        label="slave",
+        master=master_sensor,
+        fixed_location=True,
+        fixed_rotation=False,
+        rotation=None,
+        rotation_covariance=None,
+    )
+    chunk = SimpleNamespace(sensors=[master_sensor, slave_sensor])
+
+    summary = module.summarize_multicamera_sensor_offsets(chunk)
+
+    assert summary["sensor_count"] == 2
+    assert summary["slave_sensor_count"] == 1
+    assert summary["slave_rotation_estimated_count"] == 0
+    assert summary["missing_slave_rotation_count"] == 1
+    assert summary["missing_slave_rotation"] == [
+        {"sensor_key": 1, "sensor_label": "slave", "master_sensor_key": 0}
+    ]
+
+
+def test_summarize_multicamera_sensor_offsets_reports_estimated_slave_rotation():
+    module = load_pipeline_module()
+    master_sensor = SimpleNamespace(
+        key=0,
+        label="master",
+        master=None,
+        fixed_location=True,
+        fixed_rotation=True,
+        rotation=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        rotation_covariance=[[0.0, 0.0, 0.0]],
+    )
+    master_sensor.master = master_sensor
+    slave_sensor = SimpleNamespace(
+        key=1,
+        label="slave",
+        master=master_sensor,
+        fixed_location=True,
+        fixed_rotation=False,
+        rotation=[[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        rotation_covariance=[[1.0, 0.0, 0.0]],
+    )
+    chunk = SimpleNamespace(sensors=[master_sensor, slave_sensor])
+
+    summary = module.summarize_multicamera_sensor_offsets(chunk)
+
+    assert summary["slave_rotation_estimated_count"] == 1
+    assert summary["missing_slave_rotation_count"] == 0
 
 
 def test_select_backend_prefers_cuda_for_auto_when_available(monkeypatch, tmp_path):

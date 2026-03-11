@@ -79,6 +79,8 @@ LOGGER = logging.getLogger("dual_fisheye_pipeline")
 _MENU_REGISTERED = False
 _GUI_DIALOG = None
 _APP_SHUTDOWN_CONNECTED = False
+_HEADLESS_DOCUMENT = None
+_HEADLESS_DOCUMENT_PATH = None
 _PIPELINE_SCRIPT_NAME = "metashape_dual_fisheye_pipeline.py"
 _INPUT_OSV_SUFFIX = ".osv"
 _INPUT_OSV_PLACEHOLDER = "OSV未選択"
@@ -375,9 +377,9 @@ class PipelineConfig:
     match_downscale: int = 1
     generic_preselection: bool = True
     reference_preselection: bool = False
-    keep_keypoints: bool = False
+    keep_keypoints: bool = True
     keypoint_limit: int = 40000
-    tiepoint_limit: int = 10000
+    tiepoint_limit: int = 4000
     filter_stationary_points: bool = True
     overlap_target: int = 3
     camera_distance_threshold: float = 0.15
@@ -1559,12 +1561,114 @@ def save_metashape_document(config: PipelineConfig) -> None:
 
     if Metashape is None:
         raise PipelineError("Metashape module is not available in this Python runtime.")
-    doc = Metashape.app.document
+    doc = get_or_create_metashape_document(config, create=True)
+    save_metashape_document_instance(config, doc)
+
+
+def get_or_create_metashape_document(config: PipelineConfig, create: bool = False) -> Any:
+    """Return the active Metashape document or a headless fallback document."""
+
+    global _HEADLESS_DOCUMENT
+    global _HEADLESS_DOCUMENT_PATH
+    if Metashape is None:
+        raise PipelineError("Metashape module is not available in this Python runtime.")
+
+    requested_project_path = config.project_path.resolve(strict=False)
+    active_document = getattr(Metashape.app, "document", None)
+    if active_document is not None:
+        _HEADLESS_DOCUMENT = None
+        _HEADLESS_DOCUMENT_PATH = None
+        return active_document
+
+    if _HEADLESS_DOCUMENT is not None:
+        if _HEADLESS_DOCUMENT_PATH == requested_project_path:
+            return _HEADLESS_DOCUMENT
+        _HEADLESS_DOCUMENT = None
+        _HEADLESS_DOCUMENT_PATH = None
+
+    if config.project_path.exists():
+        headless_document = Metashape.Document()
+        headless_document.open(str(config.project_path))
+        _HEADLESS_DOCUMENT = headless_document
+        _HEADLESS_DOCUMENT_PATH = requested_project_path
+        return _HEADLESS_DOCUMENT
+
+    if create:
+        _HEADLESS_DOCUMENT = Metashape.Document()
+        _HEADLESS_DOCUMENT_PATH = requested_project_path
+        return _HEADLESS_DOCUMENT
+
+    return None
+
+
+def save_metashape_document_instance(config: PipelineConfig, doc: Any) -> None:
+    """Persist the provided Metashape document to the configured project path."""
+
     config.project_path.parent.mkdir(parents=True, exist_ok=True)
     if getattr(doc, "path", ""):
         doc.save()
         return
     doc.save(str(config.project_path))
+
+
+def metashape_metadata_value(metadata: Any, key: str, default: Any = None) -> Any:
+    """Read Metashape metadata without assuming a dict-like .get() method exists."""
+
+    if metadata is None:
+        return default
+    if hasattr(metadata, "get"):
+        try:
+            return metadata.get(key, default)
+        except TypeError:
+            pass
+    try:
+        value = metadata[key]
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def summarize_multicamera_sensor_offsets(chunk: Any) -> Dict[str, Any]:
+    """Summarize whether slave-sensor relative rotation was estimated after alignment."""
+
+    sensor_rows: List[Dict[str, Any]] = []
+    slave_sensor_rows: List[Dict[str, Any]] = []
+    missing_slave_rotation: List[Dict[str, Any]] = []
+    for sensor in getattr(chunk, "sensors", []):
+        master = getattr(sensor, "master", None)
+        sensor_key = getattr(sensor, "key", None)
+        master_key = getattr(master, "key", None) if master is not None else None
+        is_slave = master_key is not None and sensor_key is not None and master_key != sensor_key
+        rotation_available = getattr(sensor, "rotation", None) is not None
+        row = {
+            "sensor_key": sensor_key,
+            "sensor_label": getattr(sensor, "label", ""),
+            "master_sensor_key": master_key,
+            "is_slave": is_slave,
+            "fixed_location": getattr(sensor, "fixed_location", None),
+            "fixed_rotation": getattr(sensor, "fixed_rotation", None),
+            "rotation_available": rotation_available,
+            "rotation_covariance_available": getattr(sensor, "rotation_covariance", None) is not None,
+        }
+        sensor_rows.append(row)
+        if is_slave:
+            slave_sensor_rows.append(row)
+            if not rotation_available:
+                missing_slave_rotation.append(
+                    {
+                        "sensor_key": sensor_key,
+                        "sensor_label": getattr(sensor, "label", ""),
+                        "master_sensor_key": master_key,
+                    }
+                )
+    return {
+        "sensor_count": len(sensor_rows),
+        "slave_sensor_count": len(slave_sensor_rows),
+        "slave_rotation_estimated_count": sum(1 for row in slave_sensor_rows if row["rotation_available"]),
+        "missing_slave_rotation_count": len(missing_slave_rotation),
+        "missing_slave_rotation": missing_slave_rotation,
+        "sensors": sensor_rows,
+    }
 
 
 class LogWriter:
@@ -3016,10 +3120,10 @@ class MetashapeImporter:
         )
 
     def set_sensor_types(self, chunk: Any) -> None:
-        """Set all sensors to fisheye as required by the spec."""
+        """Set all sensors to EquisolidFisheye as required by the spec."""
 
         for sensor in getattr(chunk, "sensors", []):
-            sensor.type = Metashape.Sensor.Type.Fisheye
+            sensor.type = Metashape.Sensor.Type.EquisolidFisheye
 
     def apply_rig_reference(self, chunk: Any, config: PipelineConfig) -> None:
         """Optional rig reference hook."""
@@ -3104,14 +3208,13 @@ class MetashapeImporter:
     def save_document(self, doc: Any) -> None:
         """Save the project after import."""
 
-        del doc
-        save_metashape_document(self.config)
+        save_metashape_document_instance(self.config, doc)
 
     def run(self) -> PhaseResult:
         """Create or reuse a chunk, import paired images, and apply per-camera masks."""
 
         self._require_metashape()
-        doc = Metashape.app.document
+        doc = get_or_create_metashape_document(self.config, create=True)
         chunk = self.create_or_get_chunk(doc, name=self.config.chunk_name)
         pairs = collect_frame_pairs(self.config.selected_front_dir, self.config.selected_back_dir)
 
@@ -3233,7 +3336,7 @@ class MetashapeAligner:
                     "camera_side": self._side_for_camera(camera),
                     "enabled": getattr(camera, "enabled", True),
                     "aligned": self.camera_is_aligned(camera),
-                    "image_quality": getattr(camera, "meta", {}).get("Image/Quality", ""),
+                    "image_quality": metashape_metadata_value(getattr(camera, "meta", None), "Image/Quality", ""),
                     "quality_keep_rule": decision.get("quality_keep_rule", ""),
                     "disabled_reason": decision.get("disabled_reason", ""),
                 }
@@ -3261,7 +3364,7 @@ class MetashapeAligner:
             generic_preselection=config.generic_preselection,
             reference_preselection=config.reference_preselection,
             filter_mask=True,
-            mask_tiepoints=True,
+            mask_tiepoints=False,
             filter_stationary_points=config.filter_stationary_points,
             keep_keypoints=config.keep_keypoints,
             keypoint_limit=config.keypoint_limit,
@@ -3269,10 +3372,16 @@ class MetashapeAligner:
             reset_matches=reset_matches,
         )
 
-    def align_cameras(self, chunk: Any, reset_alignment: bool = False) -> None:
-        """Run initial camera alignment."""
+    def align_cameras(self, chunk: Any, reset_alignment: bool = True) -> None:
+        """Run camera alignment with optional reset of current alignment."""
 
         chunk.alignCameras(reset_alignment=reset_alignment)
+
+    @staticmethod
+    def sensor_offset_summary(chunk: Any) -> Dict[str, Any]:
+        """Return a compact summary of multi-camera slave-sensor offset estimation."""
+
+        return summarize_multicamera_sensor_offsets(chunk)
 
     def realign_after_cleanup(self, chunk: Any, config: PipelineConfig) -> None:
         """Rerun alignment after overlap cleanup."""
@@ -3280,14 +3389,14 @@ class MetashapeAligner:
         if sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)) < 2:
             return
         self.match_photos(chunk, config, reset_matches=True)
-        # TODO: validate alignCameras(reset_alignment=True) behavior on the current Metashape build.
         self.align_cameras(chunk, reset_alignment=True)
 
     def run(self) -> PhaseResult:
         """Analyze quality and align the active chunk when cameras are available."""
 
         self._require_metashape()
-        chunk = getattr(Metashape.app.document, "chunk", None)
+        document = get_or_create_metashape_document(self.config, create=False)
+        chunk = getattr(document, "chunk", None) if document is not None else None
         if chunk is None:
             return PhaseResult("align", "skipped", "No active chunk is available.", {})
         if not getattr(chunk, "cameras", []):
@@ -3301,9 +3410,16 @@ class MetashapeAligner:
         enabled_camera_count = sum(1 for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True))
         if enabled_camera_count < 2:
             raise PipelineError("Fewer than two enabled cameras remain after Image/Quality filtering.")
-        self.match_photos(chunk, self.config)
-        self.align_cameras(chunk)
+        self.match_photos(chunk, self.config, reset_matches=True)
+        self.align_cameras(chunk, reset_alignment=True)
         self.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
+        sensor_offset_summary = self.sensor_offset_summary(chunk)
+        if sensor_offset_summary["missing_slave_rotation_count"] > 0:
+            LOGGER.warning(
+                "Slave sensor rotation was not estimated for %d sensors: %s",
+                sensor_offset_summary["missing_slave_rotation_count"],
+                sensor_offset_summary["missing_slave_rotation"],
+            )
         save_metashape_document(self.config)
         return PhaseResult(
             phase="align",
@@ -3315,6 +3431,7 @@ class MetashapeAligner:
                 "disabled_low_quality_count": disabled_count,
                 "aligned_camera_count": self.aligned_camera_count(chunk),
                 "quality_csv": self.config.metashape_quality_log_path,
+                "sensor_offset_summary": sensor_offset_summary,
             },
         )
 
@@ -3366,7 +3483,7 @@ class MetashapeAligner:
 
     @staticmethod
     def camera_quality(camera: Any) -> Optional[float]:
-        value = getattr(camera, "meta", {}).get("Image/Quality")
+        value = metashape_metadata_value(getattr(camera, "meta", None), "Image/Quality")
         try:
             return float(value)
         except (TypeError, ValueError):
@@ -3489,7 +3606,8 @@ class OverlapReducer:
         """Disable redundant aligned stations and optionally realign."""
 
         self._require_metashape()
-        chunk = getattr(Metashape.app.document, "chunk", None)
+        document = get_or_create_metashape_document(self.config, create=False)
+        chunk = getattr(document, "chunk", None) if document is not None else None
         if chunk is None:
             return PhaseResult("reduce_overlap", "skipped", "No active chunk is available.", {})
 
@@ -3888,14 +4006,16 @@ class PipelineController:
             "metashape_gpu": gpu_reports["metashape"],
             "gpu_summary": gpu_reports["summary"],
         }
-        if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
-            chunk = Metashape.app.document.chunk
+        document = get_or_create_metashape_document(self.config, create=False) if Metashape is not None else None
+        if document is not None and getattr(document, "chunk", None) is not None:
+            chunk = document.chunk
             summary["active_chunk"] = {
                 "label": getattr(chunk, "label", ""),
                 "camera_count": len(getattr(chunk, "cameras", [])),
                 "enabled_camera_count": len(
                     [camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]
                 ),
+                "sensor_offset_summary": summarize_multicamera_sensor_offsets(chunk),
             }
         if extra:
             summary.update(extra)
@@ -3962,7 +4082,7 @@ class PipelineController:
 
     def _run_import_to_metashape_impl(self) -> PhaseResult:
         MetashapeImporter._require_metashape()
-        doc = Metashape.app.document
+        doc = get_or_create_metashape_document(self.config, create=True)
 
         self._set_step("import_to_metashape", "create_or_get_chunk", 1, 8)
         chunk = self.importer.create_or_get_chunk(doc, name=self.config.chunk_name)
@@ -4033,7 +4153,8 @@ class PipelineController:
 
     def _run_align_impl(self) -> PhaseResult:
         MetashapeAligner._require_metashape()
-        chunk = getattr(Metashape.app.document, "chunk", None)
+        document = get_or_create_metashape_document(self.config, create=False)
+        chunk = getattr(document, "chunk", None) if document is not None else None
         if chunk is None:
             return PhaseResult("align", "skipped", "No active chunk is available.", {})
         if not getattr(chunk, "cameras", []):
@@ -4055,7 +4176,7 @@ class PipelineController:
             raise PipelineError("Fewer than two enabled cameras remain after Image/Quality filtering.")
 
         self._set_step("align", "match_photos", 4, 6)
-        self.aligner.match_photos(chunk, self.config)
+        self.aligner.match_photos(chunk, self.config, reset_matches=True)
 
         self._set_step("align", "align_cameras", 5, 6)
         self.aligner.align_cameras(chunk)
@@ -4063,6 +4184,13 @@ class PipelineController:
         self._set_step("align", "export_quality_log_and_save", 6, 6)
         self.aligner.export_quality_log(chunk, self.config.metashape_quality_log_path, quality_decisions)
         aligned_camera_count = self.aligner.aligned_camera_count(chunk)
+        sensor_offset_summary = self.aligner.sensor_offset_summary(chunk)
+        if sensor_offset_summary["missing_slave_rotation_count"] > 0:
+            LOGGER.warning(
+                "Slave sensor rotation was not estimated for %d sensors: %s",
+                sensor_offset_summary["missing_slave_rotation_count"],
+                sensor_offset_summary["missing_slave_rotation"],
+            )
         if aligned_camera_count < 2:
             raise PipelineError(
                 "Alignment produced too few aligned cameras: {0}. Check masks, quality thresholds, and overlap.".format(
@@ -4080,12 +4208,14 @@ class PipelineController:
                 "disabled_low_quality_count": disabled_count,
                 "aligned_camera_count": aligned_camera_count,
                 "quality_csv": self.config.metashape_quality_log_path,
+                "sensor_offset_summary": sensor_offset_summary,
             },
         )
 
     def _run_reduce_overlap_impl(self) -> PhaseResult:
         OverlapReducer._require_metashape()
-        chunk = getattr(Metashape.app.document, "chunk", None)
+        document = get_or_create_metashape_document(self.config, create=False)
+        chunk = getattr(document, "chunk", None) if document is not None else None
         if chunk is None:
             return PhaseResult("reduce_overlap", "skipped", "No active chunk is available.", {})
 
@@ -5163,8 +5293,9 @@ if QtWidgets is not None:
             overlap_rows = self._count_csv_rows(self.config.overlap_reduction_log_path)
             enabled_cameras = 0
             aligned_cameras = 0
-            if Metashape is not None and getattr(Metashape.app.document, "chunk", None) is not None:
-                chunk = Metashape.app.document.chunk
+            document = get_or_create_metashape_document(self.config, create=False) if Metashape is not None else None
+            if document is not None and getattr(document, "chunk", None) is not None:
+                chunk = document.chunk
                 enabled_cameras = len(
                     [camera for camera in getattr(chunk, "cameras", []) if getattr(camera, "enabled", True)]
                 )
@@ -5540,7 +5671,11 @@ def initialize_plugin() -> None:
 def shutdown_plugin() -> None:
     """Release GUI and logger state that can otherwise survive until application exit."""
 
+    global _HEADLESS_DOCUMENT
+    global _HEADLESS_DOCUMENT_PATH
     cleanup_gui_dialog()
+    _HEADLESS_DOCUMENT = None
+    _HEADLESS_DOCUMENT_PATH = None
     shutdown_logging(include_gui_handlers=True)
     unregister_application_shutdown()
 
